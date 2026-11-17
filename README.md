@@ -66,7 +66,7 @@ To measure speed, run `breeze-tts --bench` under `scripts/gpulock.py`. `breeze-t
 
 ## Use the library
 
-Add the package to your `Package.swift`:
+Add the package to your `Package.swift`. The repository is not published yet and has no tag, so until it is, depend on a local checkout with `.package(path: "../breeze-tts")`:
 
 ```swift
 .package(url: "https://github.com/maralski/breeze-tts.git", from: "0.1.0")
@@ -87,7 +87,7 @@ for try await chunk in model.stream(request) {
 }
 ```
 
-`BreezeCheckpoint.find()` returns the folder `BREEZE_WEIGHTS` names, or the newest snapshot in the Hugging Face cache. Use it to locate the checkpoint instead of a fixed path.
+`BreezeCheckpoint.find()` returns the checkpoint `BREEZE_WEIGHTS` names, or the newest snapshot in the Hugging Face cache, or nil. Pass its `directory` to the model instead of a fixed path.
 
 `stream(_:options:)` wraps the blocking `synthesize(_:options:onChunk:)`. Call that one directly to get a `GenerationReport` for each fragment, and stop it by throwing from the callback:
 
