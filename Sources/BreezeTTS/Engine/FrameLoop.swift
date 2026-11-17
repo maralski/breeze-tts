@@ -56,6 +56,22 @@ final class FrameLoop {
 
     static let logitsStride = 2052
 
+    /// Where `tap` is called while a frame is encoded.
+    enum Tap {
+        /// `depthInput` holds the backbone's final hidden state of every sequence.
+        case backboneHidden
+        /// `logits` holds the lm_head rows.
+        case backboneLogits
+        /// `logits` holds codebook `q`'s head rows.
+        case depthLogits(Int)
+    }
+
+    /// Encodes extra work (copies of intermediate state) at each `Tap` point.
+    var tap: ((Encoder, Tap) -> Void)?
+    /// uint32 [maxFrames, 16]. When set, the embeddings read the codes here instead of the
+    /// sampled ones, which still land in `codes`: teacher forcing.
+    var teacher: MTLBuffer?
+
     init(ctx: MetalContext, weights: FrameWeights, sequences: Int, maxFrames: Int) throws {
         precondition(sequences == 1 || sequences == 2)
         self.weights = weights
@@ -119,10 +135,12 @@ final class FrameLoop {
                      uniforms: uniforms, uniformsOffset: slots, codes: codes, codesOffset: slots, slot: q, seen: seen, status: status)
         }
         func embed(_ q: Int, count: Int, _ out: ActView) {
-            e.embedCodes(table: weights.embedding, width: w, vocab: vocab, codes: codes, codesOffset: slots, firstCodebook: q, count: count, rows: sequences, out)
+            e.embedCodes(table: weights.embedding, width: w, vocab: vocab, codes: teacher ?? codes, codesOffset: slots, firstCodebook: q, count: count, rows: sequences, out)
         }
         let pairs = ActView(depthInput, ld: 2 * w)
+        tap?(e, .backboneHidden)
         e.linear(pairs, rows: sequences, weights.lmHead, logitRows)
+        tap?(e, .backboneLogits)
         draw(.backbone, 0)
 
         depth.cache.reset()
@@ -138,6 +156,7 @@ final class FrameLoop {
                 depth.encode(e, x: x, rows: 1, out: hidden)
             }
             e.linear(hidden, rows: sequences, weights.codebookHeads[position - 1], logitRows)
+            tap?(e, .depthLogits(position))
             draw(.depth, position)
         }
         embed(0, count: books, ActView(backboneInput, ld: w))

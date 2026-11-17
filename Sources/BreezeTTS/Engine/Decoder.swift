@@ -78,8 +78,9 @@ struct DecoderForward {
     /// Runs the layers over `rows` new rows of each sequence in `sequences`, at the positions the
     /// cache holds for them. `x` holds the rows sequence-major on entry and the residual stream
     /// on exit; the final norm of each sequence's last row goes to consecutive rows of `out`.
-    /// Advances the cache.
-    func encode(_ e: Encoder, x: ActView, rows: Int, sequences: Range<Int>? = nil, out: ActView) {
+    /// Advances the cache. `afterLayer` is called after each layer's dispatches, for a caller
+    /// that encodes copies of the residual stream.
+    func encode(_ e: Encoder, x: ActView, rows: Int, sequences: Range<Int>? = nil, out: ActView, afterLayer: ((Int) -> Void)? = nil) {
         let c = weights.config
         let range = sequences ?? 0..<cache.sequences
         let block = RowBlock(rows: rows, positions: range.map { cache.lengths[$0] })
@@ -105,6 +106,7 @@ struct DecoderForward {
             e.rmsnorm(x, rows: block.count, width: c.hidden, weight: layer.norm2, normed, eps: c.eps)
             e.linear(normed, rows: block.count, layer.gate, mlp, flags: .siluGate, gate: layer.up.w)
             e.linear(mlp, rows: block.count, layer.down, x, flags: .accumulate)
+            afterLayer?(i)
         }
         e.rmsnorm(x.row(rows - 1).strided(rows * x.ld), rows: block.sequences, width: c.hidden, weight: weights.finalNorm, out, eps: c.eps)
         cache.advance(rows, sequences: range)
