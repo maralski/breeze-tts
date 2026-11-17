@@ -159,3 +159,17 @@ These come from the fp32 greedy codes, `T = N` frames, batch dimension dropped. 
 | `transformer` | [T25, 512] |
 | `downsample` | [512, T12] |
 | `codes` | [T12, 16] i32, equal to the codes `prepare_inputs` put into the prompt |
+
+## Codec extras (`codec_extra/`)
+
+`make_codec_extras.py` loads only the audio tokenizer (about a minute) and writes three cases the generation runs do not reach. The Swift codec tests skip them when the directory is missing.
+
+```sh
+.venv/bin/python tools/reference/make_codec_extras.py
+```
+
+| directory | content |
+|---|---|
+| `long/` | the design_en greedy codes tiled to 150 frames through one full decoder forward, with the same tensors as `<case>/codec/` minus the stream runs. It passes the decoder transformer's 72-frame window, which no generation case does. |
+| `enc_odd/` | the first 50001 samples of `ref_clip_en.wav` through the encoder: a partial last frame and an odd 25 Hz length (53), so the convs' right pads run. |
+| `enc_long/` | the first 287001 samples of `long/pcm_full` as PCM16 through the encoder: 299 frames at 25 Hz, past the 250 the config names as `sliding_window`. The reference attends over all of them. |

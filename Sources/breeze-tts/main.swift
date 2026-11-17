@@ -5,18 +5,21 @@
 //   breeze-tts --bench-gemv [--repeats N] [--rounds N]
 //   breeze-tts --bench-prompt [--weights DIR] [--rounds N]
 //   breeze-tts --parity CASE_DIR [--weights DIR]   (a case of the reference goldens)
+//   breeze-tts --bench-codec [--weights DIR] [--rounds N] [--frames N] [--concurrent] [--token-loop] [--guidance S]
 // --weights defaults to BREEZE_WEIGHTS, then the Hugging Face cache. Run benchmarks under
 // scripts/gpulock.py so they never overlap.
 import BreezeTTS
 import Foundation
 
-enum Mode { case benchFrame, benchGemv, benchPrompt, parity(URL) }
+enum Mode { case benchFrame, benchGemv, benchPrompt, parity(URL), benchCodec }
 
 do {
     var mode: Mode?
     var weights: URL?
     var frame = FrameBench.Options()
     var repeats = 100, rounds: Int?
+    var codec = CodecBench.Options()
+    var frames: Int?
     var args = CommandLine.arguments.dropFirst().makeIterator()
     func value(_ flag: String) throws -> String {
         guard let v = args.next() else { throw BreezeTTSError.badInput("\(flag) needs a value") }
@@ -32,14 +35,21 @@ do {
         case "--bench-gemv": mode = .benchGemv
         case "--bench-prompt": mode = .benchPrompt
         case "--parity": mode = .parity(URL(fileURLWithPath: try value(arg)))
+        case "--bench-codec": mode = .benchCodec
+        case "--token-loop": codec.tokenLoop = true
         case "--weights": weights = URL(fileURLWithPath: try value(arg))
         case "--rounds": rounds = try int(arg)
-        case "--frames": frame.frames = max(2, try int(arg))
+        case "--frames":
+            frames = max(2, try int(arg))
+            frame.frames = frames!
         case "--repeats": repeats = try int(arg)
-        case "--concurrent": frame.concurrent = true
+        case "--concurrent":
+            frame.concurrent = true
+            codec.concurrent = true
         case "--guidance":
             guard let s = Float(try value(arg)) else { throw BreezeTTSError.badInput("--guidance needs a number") }
             frame.guidance = s
+            codec.guidance = s
         default: throw BreezeTTSError.badInput("unknown argument \(arg)")
         }
     }
@@ -50,6 +60,13 @@ do {
         }
         if let rounds { frame.rounds = rounds }
         try FrameBench.run(directory: dir, options: frame)
+    case .benchCodec:
+        guard let dir = weights ?? FrameBench.defaultWeights() else {
+            throw BreezeTTSError.badCheckpoint("no checkpoint: pass --weights or set BREEZE_WEIGHTS")
+        }
+        if let rounds { codec.rounds = rounds }
+        if let frames { codec.frames = frames }
+        try CodecBench.run(directory: dir, options: codec)
     case .benchGemv:
         try GemvBench.run(repeats: repeats, rounds: rounds ?? 5)
     case .benchPrompt:
@@ -66,7 +83,7 @@ do {
         print(report.description)
         if !report.passed { exit(1) }
     case nil:
-        print("usage: breeze-tts --bench-frame [--weights DIR] [--rounds N] [--frames N] [--concurrent] | --bench-gemv [--repeats N] [--rounds N] | --parity CASE_DIR [--weights DIR]")
+        print("usage: breeze-tts --bench-frame | --bench-gemv | --bench-prompt | --bench-codec [--token-loop] | --parity CASE_DIR, with [--weights DIR] [--rounds N] [--frames N] [--concurrent] [--guidance S]")
     }
 } catch {
     FileHandle.standardError.write("breeze-tts: \(error)\n".data(using: .utf8)!)
