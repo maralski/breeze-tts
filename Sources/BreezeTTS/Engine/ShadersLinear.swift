@@ -3,7 +3,7 @@
 // Metal shader source, compiled at load time so the kernels work inside an .app bundle
 // without a resource bundle. Weights are bf16, activations and accumulation fp32.
 enum ShaderSource {
-    static let all = common + gemv + gemm + norm + attention + sampling + codec
+    static let all = common + gemv + gemvInt8 + gemm + norm + attention + sampling + codec
 }
 
 // The projection kernels, adapted from MingTTS.
@@ -332,6 +332,106 @@ extension ShaderSource {
         out[lane * 2] = A.thread_elements()[0];
         out[lane * 2 + 1] = A.thread_elements()[1];
     }
+
+    """#
+
+    // The scalar GEMV over `Int8Stripes` weights: W is int8 [N, K], S fp16 [N, 32], and
+    // w[n, k] = W[n, k] * S[n, (k / 16) % 32]. Lanes stride K by 16 int8 (16 bytes), so lane l
+    // reads exactly the weights that share S[n, l] and scales its sum once, after the loop.
+    // Same grid, flags and layout parameters as gemv_kernel, without a bias; K a multiple of 512.
+    // A 16-byte weight load meets four float4 of x here, against two in the bf16 kernel.
+    static let gemvInt8 = #"""
+    inline void unpack16(uint4 v, thread float4* out) {
+        out[0] = float4(as_type<char4>(v.x)); out[1] = float4(as_type<char4>(v.y));
+        out[2] = float4(as_type<char4>(v.z)); out[3] = float4(as_type<char4>(v.w));
+    }
+
+    template <int MR, int NR>
+    kernel void gemv_i8_kernel(device const float* X [[buffer(0)]],
+                               device const char* W [[buffer(1)]],
+                               device const char* W2 [[buffer(2)]],
+                               device const half* S [[buffer(3)]],
+                               device float* Y [[buffer(4)]],
+                               constant GemvParams& p [[buffer(5)]],
+                               device const half* S2 [[buffer(6)]],
+                               uint2 tgid [[threadgroup_position_in_grid]],
+                               uint sgid [[simdgroup_index_in_threadgroup]],
+                               uint lane [[thread_index_in_simdgroup]]) {
+        const uint n0 = (tgid.x * p.sg + sgid) * NR;
+        if (n0 >= p.N) return;
+        const uint row0 = tgid.y * MR;
+        const uint rows = min(uint(MR), p.M - row0);
+        device const float* x = X + row0 * p.ldx;
+        const bool gated = (p.flags & GEMV_GATED) != 0;
+        // Columns past N read the last column's weights and are never written.
+        device const char* w[NR];
+        device const char* w2[NR];
+        float acc[NR][MR], acc2[NR][MR];
+        #pragma clang loop unroll(full)
+        for (int r = 0; r < NR; r++) {
+            const uint n = min(n0 + r, p.N - 1);
+            w[r] = W + n * p.K;
+            w2[r] = W2 + n * p.K;
+            #pragma clang loop unroll(full)
+            for (int m = 0; m < MR; m++) { acc[r][m] = 0.0f; acc2[r][m] = 0.0f; }
+        }
+        for (uint k = lane * 16; k < p.K; k += 512) {
+            float4 a[MR][4];
+            #pragma clang loop unroll(full)
+            for (int m = 0; m < MR; m++) {
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < 4; j++) {
+                    a[m][j] = 0.0f;
+                    if (uint(m) < rows) a[m][j] = *(device const float4*)(x + m * p.ldx + k + 4 * j);
+                }
+            }
+            #pragma clang loop unroll(full)
+            for (int r = 0; r < NR; r++) {
+                float4 wf[4], wg[4];
+                unpack16(*(device const uint4*)(w[r] + k), wf);
+                if (gated) unpack16(*(device const uint4*)(w2[r] + k), wg);
+                #pragma clang loop unroll(full)
+                for (int m = 0; m < MR; m++) {
+                    acc[r][m] += dot(a[m][0], wf[0]) + dot(a[m][1], wf[1]) + dot(a[m][2], wf[2]) + dot(a[m][3], wf[3]);
+                    if (gated) acc2[r][m] += dot(a[m][0], wg[0]) + dot(a[m][1], wg[1]) + dot(a[m][2], wg[2]) + dot(a[m][3], wg[3]);
+                }
+            }
+        }
+        #pragma clang loop unroll(full)
+        for (int r = 0; r < NR; r++) {
+            const uint n = min(n0 + r, p.N - 1);
+            const float s = float(S[n * 32 + lane]);
+            const float s2 = gated ? float(S2[n * 32 + lane]) : 0.0f;
+            #pragma clang loop unroll(full)
+            for (int m = 0; m < MR; m++) {
+                acc[r][m] = simd_sum(acc[r][m] * s);
+                if (gated) acc2[r][m] = simd_sum(acc2[r][m] * s2);
+            }
+        }
+        if (lane != 0) return;
+        #pragma clang loop unroll(full)
+        for (int r = 0; r < NR; r++) {
+            const uint n = n0 + r;
+            if (n >= p.N) continue;
+            #pragma clang loop unroll(full)
+            for (int m = 0; m < MR; m++) {
+                if (uint(m) < rows) {
+                    float v = acc[r][m];
+                    if (gated) v = gate_act(v, p.flags) * acc2[r][m];
+                    if (p.flags & GEMV_GELU) v = gelu_tanh(v);
+                    if (p.flags & GEMV_SILU) v = silu(v);
+                    device float* y = Y + (row0 + m) * p.ldy + n;
+                    if (p.flags & GEMV_ACCUM) v += *y;
+                    *y = v;
+                }
+            }
+        }
+    }
+
+    #define GEMV_I8_INSTANCE(MR, NR) template [[host_name("gemv_i8_" #MR "_" #NR)]] kernel void gemv_i8_kernel<MR, NR>(device const float*, device const char*, device const char*, device const half*, device float*, constant GemvParams&, device const half*, uint2, uint, uint);
+    GEMV_I8_INSTANCE(1, 1) GEMV_I8_INSTANCE(1, 2) GEMV_I8_INSTANCE(1, 4)
+    GEMV_I8_INSTANCE(2, 1) GEMV_I8_INSTANCE(2, 2) GEMV_I8_INSTANCE(2, 4)
+    #undef GEMV_I8_INSTANCE
 
     """#
 

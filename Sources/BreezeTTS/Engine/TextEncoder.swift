@@ -170,7 +170,7 @@ struct TextEncoder {
             e.linear(attn, rows: rows, layer.o, delta)
             e.rmsnorm(delta, rows: rows, width: c.hidden, weight: layer.postAttentionNorm, x, eps: c.eps, onePlusWeight: true, accumulate: true)
             e.rmsnorm(x, rows: rows, width: c.hidden, weight: layer.preFeedForwardNorm, normed, eps: c.eps, onePlusWeight: true)
-            e.linear(normed, rows: rows, layer.gate, mlp, flags: .geluGate, gate: layer.up.w)
+            e.linear(normed, rows: rows, layer.gate, mlp, flags: .geluGate, gate: layer.up)
             e.linear(mlp, rows: rows, layer.down, delta)
             e.rmsnorm(delta, rows: rows, width: c.hidden, weight: layer.postFeedForwardNorm, x, eps: c.eps, onePlusWeight: true, accumulate: true)
             afterLayer?(i)

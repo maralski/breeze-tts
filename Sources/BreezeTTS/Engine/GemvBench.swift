@@ -82,7 +82,7 @@ public enum GemvBench {
                     for _ in 0..<repeats {
                         if offset + s.bytes > poolBytes { offset = 0 }
                         let lin = Linear(w: GPUTensor(buffer: pool, offset: offset, count: s.n * s.k), bias: nil, n: s.n, k: s.k)
-                        let gate = s.flags.isGated ? GPUTensor(buffer: pool, offset: offset + s.n * s.k * 2, count: s.n * s.k) : nil
+                        let gate = s.flags.isGated ? Linear(w: GPUTensor(buffer: pool, offset: offset + s.n * s.k * 2, count: s.n * s.k), bias: nil, n: s.n, k: s.k) : nil
                         e.linear(ActView(x, ld: s.k), rows: s.m, lin, ActView(y, ld: s.n), flags: s.flags, gate: gate)
                         offset += s.bytes
                     }

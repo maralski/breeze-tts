@@ -136,12 +136,12 @@ final class Synthesizer {
 
     static let positions = BreezePrompt.backbonePositions
 
-    init(directory: URL, ctx: MetalContext? = nil) throws {
+    init(directory: URL, ctx: MetalContext? = nil, depth: DepthWeightFormat = .bf16) throws {
         let ctx = try ctx ?? MetalContext()
         self.ctx = ctx
         kernels = try Kernels(ctx: ctx)
         let store = try ShardedCheckpoint(directory: directory)
-        frameWeights = try FrameWeights(store, ctx: ctx)
+        frameWeights = try FrameWeights(store, ctx: ctx, depth: depth)
         let config = TextEncoderConfig.t5gemma2
         let textWeights = try WeightArena.load(store, ctx: ctx, label: "weights.text") { try TextEncoderWeights($0, config: config) }
         text = try TextEncoder(ctx: ctx, weights: textWeights, config: config, maxRows: Self.positions)

@@ -71,6 +71,19 @@ public struct BreezeGenerationReport: Sendable {
     }
 }
 
+/// How the depth decoder's MLP weights are held in memory. The depth decoder runs 15 times per
+/// frame and reads most of the weight bytes a frame touches, nearly all of them in its MLPs.
+public enum BreezeDepthWeights: Sendable {
+    /// The checkpoint's bf16 weights as they are. Matches the reference's fp32 run stage by stage.
+    case bf16
+    /// The depth decoder's MLP weights as 8-bit integers with a scale per group of weights,
+    /// computed in memory at load and never written to disk. Half the bytes per weight, so
+    /// frames come sooner; the logits move by less than the reference's own bf16 arithmetic
+    /// moves them, and the audio is no longer the bf16 path's sample for sample. See the README
+    /// for the measured speed and the quality study.
+    case int8
+}
+
 /// Breeze TTS 2 on the GPU. Audio is 24 kHz mono Float32, produced while the model generates.
 /// One request runs at a time; concurrent calls wait their turn.
 public final class BreezeTTSModel: @unchecked Sendable {
@@ -87,10 +100,16 @@ public final class BreezeTTSModel: @unchecked Sendable {
     /// `directory` holds the Hugging Face snapshot of `BreezeCheckpoint.repository`.
     /// - Throws: `BreezeTTSError.badCheckpoint` naming the files the folder lacks.
     ///   `BreezeCheckpoint` makes the same check without loading.
-    public init(directory: URL) throws {
+    public convenience init(directory: URL) throws { try self.init(directory: directory, depthWeights: .bf16) }
+
+    /// As `init(directory:)`, with the depth decoder's weights held as `depthWeights`.
+    public init(directory: URL, depthWeights: BreezeDepthWeights) throws {
         try BreezeCheckpoint(directory: directory).require(BreezeCheckpoint.synthesisFiles)
         self.directory = directory
-        synth = try Synthesizer(directory: directory)
+        var format: DepthWeightFormat = depthWeights == .int8 ? .int8 : .bf16
+        // The quality study's control arm: the int8 weights on the bf16 kernels.
+        if format == .int8, ProcessInfo.processInfo.environment["BREEZE_INT8_REFERENCE"] != nil { format = .int8Reference }
+        synth = try Synthesizer(directory: directory, depth: format)
         decoder = try CodecDecoder(directory: directory, ctx: synth.ctx)
         tokenizer = try BreezeTokenizer(tokenizerJSON: directory.appendingPathComponent("tokenizer.json"))
         // Every pipeline compiled up front. The frame loops stay lazy: building both at load saved
