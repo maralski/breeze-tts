@@ -25,7 +25,7 @@ struct BreezeTokenizer: Sendable {
         let data = try Data(contentsOf: url)
         func fail(_ what: String) -> BreezeTTSError { .badCheckpoint("\(url.lastPathComponent): \(what)") }
         var config: [String: JSONScanner.Value] = [:]
-        var vocab = ByteTable(capacity: 1 << 19)
+        var vocab = ByteTable(capacity: 1 << 20)
         var merges: [UInt64: Merge] = [:]
         var addedTokens: [JSONScanner.Value] = []
         do {
@@ -113,7 +113,7 @@ struct BreezeTokenizer: Sendable {
                 var parts = 0
                 try scanner.forEachElement { scanner in
                     parts += 1
-                    try scanner.readString(into: &(parts == 1 ? left : right))
+                    if parts == 1 { try scanner.readString(into: &left) } else { try scanner.readString(into: &right) }
                 }
                 guard parts == 2 else { throw fail("merge \(rank)") }
             }
