@@ -1,0 +1,6 @@
+.build/
+.swiftpm/
+*.wav
+.audit/
+.venv/
+__pycache__/
