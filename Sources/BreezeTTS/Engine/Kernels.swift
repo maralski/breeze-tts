@@ -220,8 +220,10 @@ final class Encoder {
     nonisolated(unsafe) static var scalarRowsMax = 2
     /// Output columns (simdgroups) per threadgroup of the scalar kernel. Overridable for the micro-bench.
     nonisolated(unsafe) static var gemvSimdgroups = 4
-    /// Simdgroups sharing one (row, KV head) of the backbone attention at decode. Overridable for the micro-bench.
-    nonisolated(unsafe) static var causalDecodeSplit = 4
+    /// Simdgroups sharing one (row, KV head) of the backbone attention at decode. Measured at 300
+    /// cached keys on an M3 Max: 81 us per dispatch with one, 34 with four, 22 with eight.
+    /// Overridable for the micro-bench.
+    nonisolated(unsafe) static var causalDecodeSplit = 8
 
     /// y[m, n] = sum_k x[m, k] w[n, k] with the epilogue in `flags`. `gate` holds the second
     /// matrix for a gated flag, in which case `linear` is the gate projection. Rows of x past m

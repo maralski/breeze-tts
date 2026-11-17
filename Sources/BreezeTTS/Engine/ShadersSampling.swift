@@ -37,13 +37,23 @@ extension ShaderSource {
     };
     constant int SAMPLE_TG = 256;
     constant int SAMPLE_SG = SAMPLE_TG / 32;
-    constant int SAMPLE_MAXN = 2056;
     constant int SAMPLE_OWN = 9;
+    constant int SAMPLE_SPAN = 32 * SAMPLE_OWN;
     constant uint SAMPLE_NONE = 0xFFFFFFFFu;
     constant uint STATUS_BAD_LOGITS = 1;
 
+    // Floats as unsigned keys in the same order (-inf lowest, +inf highest).
+    inline uint order_key(float v) {
+        const uint b = as_type<uint>(v);
+        return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+    }
+
     // One draw as one threadgroup of 256 threads: larger single threadgroups wait for a whole
-    // GPU core whenever another process draws. Thread t owns tokens t, t + 256, ...
+    // GPU core whenever another process draws. Thread t owns the nine token ids from 9 t, so a
+    // simdgroup owns a contiguous id range in lane order. The top-k cut is found by bisection on
+    // the score's bit pattern, one count over all threads per bit, instead of sorting or ranking;
+    // the survivors are compacted per simdgroup with a prefix sum, and one thread then walks them
+    // in ascending id for the running sums the rule prescribes.
     // BACKBONE applies the repetition penalty over the `seen` set and keeps top-k ties, then
     // adds the drawn token to the set; the depth variant keeps exactly top-k and clamps.
     template <int BACKBONE>
@@ -53,25 +63,25 @@ extension ShaderSource {
                               device uint* seen [[buffer(3)]],
                               device uint* status [[buffer(4)]],
                               constant SampleParams& p [[buffer(5)]],
-                              uint tid [[thread_index_in_threadgroup]],
                               uint sgid [[simdgroup_index_in_threadgroup]],
                               uint lane [[thread_index_in_simdgroup]]) {
-        threadgroup float4 x4[SAMPLE_MAXN / 4];
         threadgroup float redv[SAMPLE_SG];
-        threadgroup uint redi[SAMPLE_SG];
+        threadgroup uint redi[2][SAMPLE_SG];
         threadgroup uint redbad[SAMPLE_SG];
-        threadgroup float total;
-        threadgroup uint last;
-        threadgroup float* x = (threadgroup float*)x4;
+        threadgroup uint keptID[SAMPLE_SG][SAMPLE_SPAN];
+        threadgroup float keptE[SAMPLE_SG][SAMPLE_SPAN];
+        const uint id0 = (sgid * 32 + lane) * SAMPLE_OWN;
+        const bool writer = sgid == 0 && lane == 0;
 
         // Scores: guidance, penalty, suppression, temperature, in the reference's order.
         float own[SAMPLE_OWN];
+        uint key[SAMPLE_OWN];
         uint bad = 0;
         float best = -INFINITY;
         uint bestAt = SAMPLE_NONE;
         #pragma clang loop unroll(full)
         for (int a = 0; a < SAMPLE_OWN; a++) {
-            const uint i = tid + a * SAMPLE_TG;
+            const uint i = id0 + a;
             float v = -INFINITY;
             if (i < p.N) {
                 v = logits[i];
@@ -89,12 +99,12 @@ extension ShaderSource {
                 if (v > best) { best = v; bestAt = i; }
             }
             own[a] = v;
-            if (i < uint(SAMPLE_MAXN)) x[i] = v;
+            key[a] = order_key(v);
         }
         const float sgBest = simd_max(best);
         const uint sgAt = simd_min(best == sgBest ? bestAt : SAMPLE_NONE);
         const uint sgBad = simd_or(bad);
-        if (lane == 0) { redv[sgid] = sgBest; redi[sgid] = sgAt; redbad[sgid] = sgBad; }
+        if (lane == 0) { redv[sgid] = sgBest; redi[1][sgid] = sgAt; redbad[sgid] = sgBad; }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         float top = redv[0];
         #pragma clang loop unroll(full)
@@ -103,68 +113,96 @@ extension ShaderSource {
         uint anyBad = 0;
         #pragma clang loop unroll(full)
         for (int t = 0; t < SAMPLE_SG; t++) {
-            if (redv[t] == top) token = min(token, redi[t]);
+            if (redv[t] == top) token = min(token, redi[1][t]);
             anyBad |= redbad[t];
         }
 
         if (!p.greedy) {
-            // A token survives top-k when fewer than k tokens dominate it: strictly greater
-            // scores, and in the depth variant equal scores at a lower id as well.
-            uint dominators[SAMPLE_OWN];
-            #pragma clang loop unroll(full)
-            for (int a = 0; a < SAMPLE_OWN; a++) dominators[a] = 0;
-            for (uint j = 0; j < uint(SAMPLE_MAXN); j += 4) {
-                const float4 xv = x4[j / 4];
-                const uint4 jv = j + uint4(0, 1, 2, 3);
-                #pragma clang loop unroll(full)
-                for (int a = 0; a < SAMPLE_OWN; a++) {
-                    bool4 over = xv > own[a];
-                    if (!BACKBONE) over = over | ((xv == own[a]) & (jv < uint4(tid + a * SAMPLE_TG)));
-                    const uint4 one = select(uint4(0), uint4(1), over);
-                    dominators[a] += one.x + one.y + one.z + one.w;
+            // Counts over all 256 threads alternate between two slots, so one barrier a round
+            // separates this round's reads from the next round's writes.
+            uint slot = 0;
+            #define SAMPLE_COUNT(result, condition) { \
+                uint n_ = 0; \
+                for (int a = 0; a < SAMPLE_OWN; a++) n_ += uint(condition); \
+                n_ = simd_sum(n_); \
+                if (lane == 0) redi[slot][sgid] = n_; \
+                threadgroup_barrier(mem_flags::mem_threadgroup); \
+                n_ = 0; \
+                for (int t = 0; t < SAMPLE_SG; t++) n_ += redi[slot][t]; \
+                slot ^= 1; \
+                result = n_; \
+            }
+            // cut = the k-th largest key: the largest value that at least k keys reach.
+            uint cut = 0;
+            for (int bit = 31; bit >= 0; bit--) {
+                const uint candidate = cut | (1u << bit);
+                uint reach;
+                SAMPLE_COUNT(reach, key[a] >= candidate)
+                if (reach >= p.topK) cut = candidate;
+            }
+            // The depth sampler keeps exactly k: of the tokens at the cut, the lowest ids, up to
+            // lastTie, the id of the last one there is room for.
+            uint lastTie = SAMPLE_NONE;
+            if (!BACKBONE) {
+                uint above;
+                SAMPLE_COUNT(above, key[a] > cut)
+                const uint room = p.topK - above;
+                lastTie = 0;
+                for (int bit = 11; bit >= 0; bit--) {
+                    const uint candidate = lastTie | (1u << bit);
+                    uint before;
+                    SAMPLE_COUNT(before, key[a] == cut && id0 + a < candidate)
+                    if (before < room) lastTie = candidate;
                 }
             }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            #undef SAMPLE_COUNT
+            // Weights of the survivors, packed per simdgroup in ascending id.
+            float e[SAMPLE_OWN];
+            bool kept[SAMPLE_OWN];
+            uint mine = 0;
             #pragma clang loop unroll(full)
             for (int a = 0; a < SAMPLE_OWN; a++) {
-                const uint i = tid + a * SAMPLE_TG;
-                if (i < uint(SAMPLE_MAXN)) {
-                    const bool kept = i < p.N && dominators[a] < p.topK && own[a] > -INFINITY;
-                    x[i] = kept ? exp(own[a] - top) : 0.0f;
+                kept[a] = own[a] > -INFINITY && (key[a] > cut || (key[a] == cut && id0 + a <= lastTie));
+                e[a] = kept[a] ? exp(own[a] - top) : 0.0f;
+                mine += uint(kept[a]);
+            }
+            uint at = simd_prefix_exclusive_sum(mine);
+            const uint inGroup = simd_sum(mine);
+            #pragma clang loop unroll(full)
+            for (int a = 0; a < SAMPLE_OWN; a++) {
+                if (kept[a]) {
+                    keptID[sgid][at] = id0 + a;
+                    keptE[sgid][at] = e[a];
+                    at++;
                 }
             }
+            if (lane == 0) redi[slot][sgid] = inGroup;
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            // Running sums in ascending token id, one fp32 add each.
-            if (tid == 0) {
-                float c = 0.0f;
-                uint lastKept = SAMPLE_NONE;
-                for (uint j = 0; j < p.N; j++) {
-                    const float e = x[j];
-                    if (e > 0.0f) lastKept = j;
-                    c += e;
-                    x[j] = c;
-                }
-                total = c;
-                last = lastKept;
+            if (!writer) return;
+            // Running sums in ascending token id, one fp32 add each; tokens outside the kept
+            // set would add zero.
+            float total = 0.0f;
+            #pragma clang loop unroll(disable)
+            for (int t = 0; t < SAMPLE_SG; t++) {
+                for (uint j = 0; j < redi[slot][t]; j++) total += keptE[t][j];
             }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
             const float target = uniforms[p.slot] * total;
-            uint firstOver = SAMPLE_NONE;
-            #pragma clang loop unroll(full)
-            for (int a = SAMPLE_OWN - 1; a >= 0; a--) {
-                const uint i = tid + a * SAMPLE_TG;
-                if (i < p.N && x[i] > target) firstOver = i;
+            float c = 0.0f;
+            uint last = SAMPLE_NONE;
+            token = SAMPLE_NONE;
+            #pragma clang loop unroll(disable)
+            for (int t = 0; t < SAMPLE_SG; t++) {
+                for (uint j = 0; j < redi[slot][t]; j++) {
+                    const float w = keptE[t][j];
+                    c += w;
+                    if (w > 0.0f) last = keptID[t][j];
+                    if (c > target && token == SAMPLE_NONE) token = keptID[t][j];
+                }
             }
-            firstOver = simd_min(firstOver);
-            if (lane == 0) redi[sgid] = firstOver;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            token = redi[0];
-            #pragma clang loop unroll(full)
-            for (int t = 1; t < SAMPLE_SG; t++) token = min(token, redi[t]);
             if (token == SAMPLE_NONE) token = last;
             if (!(total > 0.0f) || isinf(total)) anyBad = 1;
         }
-        if (tid != 0) return;
+        if (!writer) return;
         if (token == SAMPLE_NONE || isinf(top)) anyBad = 1;
         if (anyBad) status[0] = status[0] | STATUS_BAD_LOGITS;
         token = min(token, BACKBONE ? p.N - 1 : p.clampMax);
@@ -172,8 +210,8 @@ extension ShaderSource {
         if (BACKBONE) seen[token] = 1;
     }
 
-    template [[host_name("sample_backbone")]] kernel void sample_kernel<1>(device const float*, device const float*, device uint*, device uint*, device uint*, constant SampleParams&, uint, uint, uint);
-    template [[host_name("sample_depth")]] kernel void sample_kernel<0>(device const float*, device const float*, device uint*, device uint*, device uint*, constant SampleParams&, uint, uint, uint);
+    template [[host_name("sample_backbone")]] kernel void sample_kernel<1>(device const float*, device const float*, device uint*, device uint*, device uint*, constant SampleParams&, uint, uint);
+    template [[host_name("sample_depth")]] kernel void sample_kernel<0>(device const float*, device const float*, device uint*, device uint*, device uint*, constant SampleParams&, uint, uint);
 
     """#
 }

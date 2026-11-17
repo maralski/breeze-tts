@@ -76,8 +76,9 @@ final class AttentionTests: GPUTestCase {
     /// 512 keys MingTTS's kernel stopped at.
     func causalCase(lengths: [Int], decode: Int, split: Int) throws {
         let hq = 4, hkv = 2, D = 128, ld = (hq + 2 * hkv) * D, B = lengths.count
+        let shipped = Encoder.causalDecodeSplit
         Encoder.causalDecodeSplit = split
-        defer { Encoder.causalDecodeSplit = 4 }
+        defer { Encoder.causalDecodeSplit = shipped }
         var rng = RNG(state: UInt64(lengths[0] * 31 + decode + split))
         let invFreq = RopeFrequencies.plain(theta: 1e6, dim: D).values
         let fb = try f32Buffer(invFreq)
@@ -134,6 +135,7 @@ final class AttentionTests: GPUTestCase {
         try causalCase(lengths: [700, 530], decode: 3, split: 4)
         try causalCase(lengths: [530], decode: 2, split: 8)
         try causalCase(lengths: [3, 1], decode: 12, split: 8)
+        try causalCase(lengths: [200], decode: 1, split: 1)
     }
 
     /// (b): a frame's depth sequence, two rows then single rows, for `sequences` sequences in one

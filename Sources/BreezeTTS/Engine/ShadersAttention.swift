@@ -6,16 +6,20 @@
 extension ShaderSource {
     static let attention = #"""
     struct AttnParams { uint B; uint M; uint hq; uint hkv; uint ldq; uint ldo; uint cap; uint seqStride; float scale; uint pos0[4]; };
-    constant int ATT_U = 8;
+    constant int ATT_P = 2;
+    constant int ATT_CHUNK = 32 * ATT_P;
 
     // (a) Backbone: causal GQA over a cache of up to thousands of keys, head dim 128.
     // An item is (row, KV head): its G query heads share every key and value load. A threadgroup
-    // is one item split over S simdgroups, which take the keys in interleaved chunks of ATT_U.
-    // A lane owns four of the 128 dims, so a key is one contiguous 512-byte load across the
-    // simdgroup and a score is one simd_sum. Scores never leave registers: each chunk is folded
-    // into a running softmax (max, sum and weighted V rescaled when the max rises), so the key
-    // count is bounded by the cache alone. The S partial softmaxes meet in threadgroup memory.
-    // Decode uses S > 1 (few items, many keys); prefill S = 1 (thousands of items).
+    // is one item split over S simdgroups, which take the keys in interleaved chunks of
+    // ATT_CHUNK. Scoring a chunk, a lane owns ATT_P keys and takes the whole 128-wide dot product
+    // itself, so no score costs a cross-lane reduction (a simd_sum per key made the first version
+    // of this kernel latency-bound at about 0.4 us a key). The chunk is then folded into a running
+    // softmax: its weights go through ATT_CHUNK floats of threadgroup memory to the second half,
+    // where a lane owns four dims and the simdgroup reads each value row as one contiguous
+    // 512 bytes. The max, sum and weighted V are rescaled whenever the max rises, so the key
+    // count is bounded by the cache alone, not by threadgroup memory. The S partial softmaxes
+    // meet in threadgroup memory. Decode uses S > 1 (few items, many keys); prefill S = 1.
     template <int S, int G>
     kernel void attention_causal(device const float* Q [[buffer(0)]],
                                  device const float* Kc [[buffer(1)]],
@@ -25,56 +29,83 @@ extension ShaderSource {
                                  uint2 tgid [[threadgroup_position_in_grid]],
                                  uint sgid [[simdgroup_index_in_threadgroup]],
                                  uint lane [[thread_index_in_simdgroup]]) {
+        threadgroup float weight[S][G][ATT_CHUNK];
         threadgroup float red[S][G][2];
         threadgroup float4 part[S][G][32];
         const uint kvh = tgid.x, row = tgid.y;
         const uint s = row / p.M;
         const uint nKeys = p.pos0[s] + row % p.M + 1;
-        device const float* q = Q + row * p.ldq + kvh * G * 128 + 4 * lane;
-        device const float* kb = Kc + s * p.seqStride + kvh * p.cap * 128 + 4 * lane;
+        device const float4* q = (device const float4*)(Q + row * p.ldq + kvh * G * 128);
+        device const float* kb = Kc + s * p.seqStride + kvh * p.cap * 128;
         device const float* vb = Vc + s * p.seqStride + kvh * p.cap * 128 + 4 * lane;
-        float4 qv[G], acc[G];
+        float4 acc[G];
         float mx[G], sum[G];
         #pragma clang loop unroll(full)
         for (int g = 0; g < G; g++) {
-            qv[g] = *(device const float4*)(q + g * 128);
             acc[g] = float4(0.0f);
             mx[g] = -INFINITY;
             sum[g] = 0.0f;
         }
-        for (uint j0 = sgid * ATT_U; j0 < nKeys; j0 += S * ATT_U) {
-            float sc[G][ATT_U];
+        for (uint c0 = sgid * ATT_CHUNK; c0 < nKeys; c0 += S * ATT_CHUNK) {
+            float sc[G][ATT_P];
             #pragma clang loop unroll(full)
-            for (int u = 0; u < ATT_U; u++) {
-                const bool ok = j0 + u < nKeys;
-                float4 k = float4(0.0f);
-                if (ok) k = *(device const float4*)(kb + (j0 + u) * 128);
+            for (int k = 0; k < ATT_P; k++) {
+                const uint j = c0 + k * 32 + lane;
                 #pragma clang loop unroll(full)
-                for (int g = 0; g < G; g++) sc[g][u] = ok ? simd_sum(dot(qv[g], k)) * p.scale : -INFINITY;
+                for (int g = 0; g < G; g++) sc[g][k] = -INFINITY;
+                if (j < nKeys) {
+                    device const float4* kr = (device const float4*)(kb + j * 128);
+                    float4 dots[G];
+                    #pragma clang loop unroll(full)
+                    for (int g = 0; g < G; g++) dots[g] = float4(0.0f);
+                    #pragma clang loop unroll(full)
+                    for (int i = 0; i < 32; i++) {
+                        const float4 kv = kr[i];
+                        #pragma clang loop unroll(full)
+                        for (int g = 0; g < G; g++) dots[g] += q[g * 32 + i] * kv;
+                    }
+                    #pragma clang loop unroll(full)
+                    for (int g = 0; g < G; g++) sc[g][k] = (dots[g].x + dots[g].y + dots[g].z + dots[g].w) * p.scale;
+                }
             }
             #pragma clang loop unroll(full)
             for (int g = 0; g < G; g++) {
-                float top = mx[g];
+                float top = sc[g][0];
                 #pragma clang loop unroll(full)
-                for (int u = 0; u < ATT_U; u++) top = max(top, sc[g][u]);
+                for (int k = 1; k < ATT_P; k++) top = max(top, sc[g][k]);
+                top = max(mx[g], simd_max(top));
                 const float carry = exp(mx[g] - top);
                 mx[g] = top;
-                sum[g] *= carry;
                 acc[g] *= carry;
+                float mine = 0.0f;
                 #pragma clang loop unroll(full)
-                for (int u = 0; u < ATT_U; u++) {
-                    sc[g][u] = exp(sc[g][u] - top);
-                    sum[g] += sc[g][u];
+                for (int k = 0; k < ATT_P; k++) {
+                    const float e = exp(sc[g][k] - top);
+                    weight[sgid][g][k * 32 + lane] = e;
+                    mine += e;
                 }
+                sum[g] = sum[g] * carry + simd_sum(mine);
             }
-            #pragma clang loop unroll(full)
-            for (int u = 0; u < ATT_U; u++) {
-                if (j0 + u < nKeys) {
-                    const float4 v = *(device const float4*)(vb + (j0 + u) * 128);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            const uint n = min(uint(ATT_CHUNK), nKeys - c0);
+            device const float* vr = vb + c0 * 128;
+            uint t = 0;
+            for (; t + 4 <= n; t += 4) {
+                float4 v[4];
+                #pragma clang loop unroll(full)
+                for (int i = 0; i < 4; i++) v[i] = *(device const float4*)(vr + (t + i) * 128);
+                #pragma clang loop unroll(full)
+                for (int g = 0; g < G; g++) {
                     #pragma clang loop unroll(full)
-                    for (int g = 0; g < G; g++) acc[g] += sc[g][u] * v;
+                    for (int i = 0; i < 4; i++) acc[g] += weight[sgid][g][t + i] * v[i];
                 }
             }
+            for (; t < n; t++) {
+                const float4 v = *(device const float4*)(vr + t * 128);
+                #pragma clang loop unroll(full)
+                for (int g = 0; g < G; g++) acc[g] += weight[sgid][g][t] * v;
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
         }
         if (S > 1) {
             #pragma clang loop unroll(full)
