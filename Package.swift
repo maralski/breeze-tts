@@ -13,6 +13,6 @@ let package = Package(
     targets: [
         .target(name: "BreezeTTS", path: "Sources/BreezeTTS"),
         .executableTarget(name: "breeze-tts", dependencies: ["BreezeTTS"], path: "Sources/breeze-tts"),
-        .testTarget(name: "BreezeTTSTests", dependencies: ["BreezeTTS"], path: "Tests/BreezeTTSTests"),
+        .testTarget(name: "BreezeTTSTests", dependencies: ["BreezeTTS"], path: "Tests/BreezeTTSTests", exclude: ["Fixtures"]),
     ]
 )
