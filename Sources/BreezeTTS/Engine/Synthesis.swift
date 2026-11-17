@@ -70,21 +70,6 @@ struct PromptLayout {
     }
 }
 
-/// How the frames are drawn. Guidance is not here: `BreezePrompt.guidance` is its one home.
-struct SynthesisOptions {
-    var maxFrames = 1500
-    var temperature: Float = 0.9
-    var topK = 50
-    var repetitionPenalty: Float = 1.1
-    var greedy = false
-    var uniforms = UniformSource.seeded(42)
-
-    func frameSettings(guidance: Float?) -> FrameSettings {
-        let s = SamplerSettings(temperature: temperature, topK: topK, repetitionPenalty: repetitionPenalty, greedy: greedy)
-        return FrameSettings(guidance: guidance, backbone: s, depth: s)
-    }
-}
-
 /// The uniform each draw consumes. Frame k's 16 values drive codebooks 0 ... 15 in order.
 enum UniformSource {
     case seeded(UInt64)
@@ -126,6 +111,9 @@ struct SynthesisReport {
     let prefillSeconds: Double
     /// Per emitted frame, wall clock from the previous frame (or the prefill) to its codes.
     let frameSeconds: [Double]
+    /// Wall clock from the start of the run to the first decoded audio; nil without a decoder
+    /// or without a frame.
+    let firstAudioSeconds: Double?
 }
 
 /// Text in, codes out: the text encoder, prompt assembly, backbone prefill and the frame loop,
@@ -242,7 +230,15 @@ final class Synthesizer {
     /// Generates frames for `prompt` until end of speech, `options.maxFrames`, or the backbone's
     /// position limit, handing each frame's 16 codes to `onFrame` as soon as it completes. Two
     /// frames are in flight at a time; a frame encoded past the stop is discarded.
-    func run(_ prompt: BreezePrompt, options: SynthesisOptions, onFrame: ([Int]) throws -> Void) throws -> SynthesisReport {
+    ///
+    /// With a `decoder`, each frame's codes are decoded on the same queue once the CPU has seen
+    /// them, so the end-of-speech frame never reaches the codec, and `onAudio` receives the
+    /// frame's 1920 samples when the decode completes. The decoder is reset first. By the time
+    /// the codes are read the next frame is already committed, so the decode goes in a command
+    /// buffer of its own behind it. Putting it at the head of the frame after next instead
+    /// costs about 40 ms more time to first audio and gains no throughput (`--bench`, M3 Max).
+    func run(_ prompt: BreezePrompt, options: SynthesisOptions, decoder: CodecDecoder? = nil, onAudio: ([Float]) throws -> Void = { _ in },
+             onFrame: ([Int]) throws -> Void) throws -> SynthesisReport {
         let layout = PromptLayout(prompt)
         let (loop, prefill) = try loop(sequences: layout.branches.count)
         let start = Date()
@@ -255,37 +251,64 @@ final class Synthesizer {
         let prefillSeconds = last.timeIntervalSince(start)
 
         loop.begin(positions: layout.branches.map(\.rows))
+        decoder?.reset()
         let settings = options.frameSettings(guidance: prompt.guidance?.scale)
-        let uniforms = options.uniforms.generator()
+        let uniforms = (options.uniforms ?? .seeded(options.seed)).generator()
         // Frame k's backbone step writes position rows + k - 1; the reference stops before 2047.
         let limit = min(options.maxFrames, Self.positions - 1 - layout.longestBranch)
-        var inFlight: [MTLCommandBuffer] = []
-        var encoded = 0, done = 0
-        var stopped = false
+        /// Command buffers in commit order: a frame's token work, or the decode of a frame read earlier.
+        enum Work { case frame(Int), decode(pcmOffset: Int, samples: Int) }
+        var queue: [(cb: MTLCommandBuffer, work: Work)] = []
+        var encoded = 0, done = 0, framesInFlight = 0
+        var finished = false, stopped = false
         var frameSeconds: [Double] = []
-        defer { for cb in inFlight { cb.waitUntilCompleted() } }
-        while done < limit {
-            while encoded < limit && inFlight.count < 2 {
+        var firstAudio: Double?
+        defer { for entry in queue { entry.cb.waitUntilCompleted() } }
+
+        func topUp() throws {
+            while !finished && encoded < limit && framesInFlight < 2 {
                 let f = encoded
                 loop.setUniforms(frame: f, uniforms(f))
-                inFlight.append(try commit { e in
+                queue.append((try commit { e in
                     if f == 0 { loop.encodeCodes(e, frame: 0, settings: settings) } else { loop.encodeFrame(e, frame: f, settings: settings) }
-                })
+                }, .frame(f)))
                 encoded += 1
+                framesInFlight += 1
             }
-            try Self.wait(inFlight.removeFirst())
-            guard loop.statusWord == 0 else { throw BreezeTTSError.gpuFailure("frame \(done) met NaN or empty logits") }
-            let frame = loop.frameCodes(done)
-            if frame[0] == BreezeShape.endOfSpeech {
-                stopped = true
-                break
-            }
-            let now = Date()
-            frameSeconds.append(now.timeIntervalSince(last))
-            last = now
-            try onFrame(frame)
-            done += 1
         }
-        return SynthesisReport(frames: done, stoppedOnEndOfSpeech: stopped, prefillSeconds: prefillSeconds, frameSeconds: frameSeconds)
+
+        try topUp()
+        while !queue.isEmpty {
+            let entry = queue.removeFirst()
+            try Self.wait(entry.cb)
+            switch entry.work {
+            case .decode(let offset, let samples):
+                firstAudio = firstAudio ?? Date().timeIntervalSince(start)
+                try onAudio(decoder!.pcm.floats(count: samples, offset: offset))
+            case .frame(let f):
+                framesInFlight -= 1
+                if finished { continue }
+                guard loop.statusWord == 0 else { throw BreezeTTSError.gpuFailure("frame \(f) met NaN or empty logits") }
+                let frame = loop.frameCodes(f)
+                if frame[0] == BreezeShape.endOfSpeech {
+                    stopped = true
+                    finished = true
+                    continue
+                }
+                let now = Date()
+                frameSeconds.append(now.timeIntervalSince(last))
+                last = now
+                try onFrame(frame)
+                done += 1
+                finished = done >= limit
+                if let decoder {
+                    let step = decoder.append(codes: loop.codes, codesOffset: f * BreezeShape.codebooks * 4)
+                    queue.append((try commit { e in for dispatch in step.dispatches { dispatch(e) } }, .decode(pcmOffset: step.pcmOffset, samples: step.samples)))
+                }
+                try topUp()
+            }
+        }
+        return SynthesisReport(frames: done, stoppedOnEndOfSpeech: stopped, prefillSeconds: prefillSeconds, frameSeconds: frameSeconds,
+                               firstAudioSeconds: firstAudio)
     }
 }

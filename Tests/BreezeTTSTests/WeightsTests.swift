@@ -138,14 +138,6 @@ final class WeightsTests: GPUTestCase {
 }
 
 enum TestEnvironment {
-    /// BREEZE_WEIGHTS, else the newest Breeze-TTS-2 snapshot in the Hugging Face cache.
-    static let weightsDirectory: URL? = {
-        let env = ProcessInfo.processInfo.environment
-        if let path = env["BREEZE_WEIGHTS"] { return URL(fileURLWithPath: path) }
-        let hub = env["HF_HUB_CACHE"].map(URL.init(fileURLWithPath:))
-            ?? URL(fileURLWithPath: env["HF_HOME"] ?? NSHomeDirectory() + "/.cache/huggingface").appendingPathComponent("hub")
-        let snapshots = hub.appendingPathComponent("models--BreezeBlue--Breeze-TTS-2/snapshots")
-        let found = (try? FileManager.default.contentsOfDirectory(at: snapshots, includingPropertiesForKeys: nil)) ?? []
-        return found.first { FileManager.default.fileExists(atPath: $0.appendingPathComponent(ShardedCheckpoint.indexName).path) }
-    }()
+    /// BREEZE_WEIGHTS, else the newest complete Breeze-TTS-2 snapshot in the Hugging Face cache.
+    static let weightsDirectory: URL? = BreezeCheckpoint.find()?.directory
 }

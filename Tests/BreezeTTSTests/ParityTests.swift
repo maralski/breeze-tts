@@ -13,7 +13,7 @@ final class ParityTests: XCTestCase {
     func harness() throws -> (BreezeParity, URL) {
         let env = ProcessInfo.processInfo.environment
         guard let goldens = env["BREEZE_GOLDENS"] else { throw XCTSkip("set BREEZE_GOLDENS to run the parity tests") }
-        guard let weights = FrameBench.defaultWeights(environment: env) else { throw XCTSkip("no Breeze-TTS-2 checkpoint") }
+        guard let weights = BreezeCheckpoint.find(environment: env)?.directory else { throw XCTSkip("no Breeze-TTS-2 checkpoint") }
         let parity = try Self.parity ?? BreezeParity(weights: weights)
         Self.parity = parity
         return (parity, URL(fileURLWithPath: goldens))
