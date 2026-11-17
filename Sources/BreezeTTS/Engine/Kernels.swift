@@ -46,8 +46,15 @@ struct GemvLayout: Hashable {
     static let simdgroupChoices = [1, 2, 4, 8, 16, 32]
     /// MingTTS's layout, the one this engine started with.
     static let fourSimdgroups = GemvLayout(simdgroups: 4, columns: 1)
-    /// The layout every shape takes unless overridden.
-    static let shipped = fourSimdgroups
+    /// One simdgroup per threadgroup computing two output columns, for every shape. Measured on
+    /// an M3 Max over guided frames, schedules interleaved in one process. In the first minute
+    /// after a rest it costs 0.4 to 1 ms of a 43 to 46 ms frame against `fourSimdgroups`. Once
+    /// generation is sustained it is ahead, by 1.0 to 6.6 ms per frame of the token loop in four
+    /// 150-frame runs with nothing else running (--bench-codec --token-loop with
+    /// BREEZE_CODEC_SCHEDULES=sg4), and by 6 to 10 ms while other processes used the GPU and the
+    /// CPUs. No per-shape table did better there. Sustained generation is the engine's job, so
+    /// this layout ships.
+    static let shipped = GemvLayout(simdgroups: 1, columns: 2)
 
     init(simdgroups: Int, columns: Int) {
         self.simdgroups = simdgroups
