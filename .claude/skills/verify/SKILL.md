@@ -104,8 +104,8 @@ Proof standards:
 | `$V/drive.sh <name> -- <args>` | Run `breeze-tts` and file the evidence. Run it with no arguments for its usage text. |
 | `$V/wavstat.py <file.wav>` | Print one WAV's facts as JSON. Use it on a reference clip before cloning it. |
 | `$V/common.sh` | Sourced by the two shell helpers. It holds the checkpoint and goldens search order. Do not run it directly. |
-| `tools/asr/transcribe.py [--lang en\|zh] WAV TEXT ...` | Transcribe WAVs and score them against their text. |
-| `tools/asr/speaker_similarity.py WAV WAV ...` | Cosine similarity of CAM++ speaker embeddings for every pair. |
+| `$BREEZE_ASR_PYTHON tools/asr/transcribe.py [--lang en\|zh] WAV TEXT ...` | Transcribe WAVs and score them against their text. `BREEZE_ASR_PYTHON` (default `python3`) must have openai-whisper and torch. |
+| `tools/asr/speaker_similarity.py WAV WAV ...` | Cosine similarity of CAM++ speaker embeddings for every pair. Run it with a Python that has onnxruntime and torchaudio, and set `CAMPPLUS_ONNX` to a `campplus.onnx` (the Ming-3.0-tts checkpoint has one). |
 
 ## The library surface
 

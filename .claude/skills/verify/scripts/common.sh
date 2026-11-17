@@ -7,6 +7,8 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 BIN="$REPO/.build/release/breeze-tts"
 EVIDENCE_ROOT="${BREEZE_VERIFY_DIR:-$REPO/.audit/verify}"
 ASR="$REPO/tools/asr/transcribe.py"
+# A Python with openai-whisper and torch; the project .venv has neither.
+ASR_PYTHON="${BREEZE_ASR_PYTHON:-python3}"
 
 # The files breeze-tts reads; BreezeCheckpoint.synthesisFiles holds the same list.
 checkpoint_complete() {
@@ -49,6 +51,6 @@ resolve_goldens() {
 # Whisper weights the ASR script reads from the Hugging Face cache.
 asr_ready() {
     local hub="${HF_HUB_CACHE:-${HF_HOME:-$HOME/.cache/huggingface}/hub}"
-    [[ -x "$ASR" ]] && [[ -x "$(head -1 "$ASR" | cut -c3-)" ]] && command -v ffmpeg >/dev/null \
+    "$ASR_PYTHON" -c "import whisper, torch" 2>/dev/null && command -v ffmpeg >/dev/null \
         && ls -d "$hub/models--mlx-community--whisper-small.en-mlx/snapshots/"*/ >/dev/null 2>&1
 }

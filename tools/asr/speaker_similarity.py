@@ -1,13 +1,16 @@
-#!/Users/m/projects/ming-ref/.venv/bin/python3
+#!/usr/bin/env python3
 # Copyright 2026 Peter Marelas
 # SPDX-License-Identifier: Apache-2.0
 """Cosine similarity of CAM++ speaker embeddings between WAVs: do they sound like one speaker?
 
     tools/asr/speaker_similarity.py [--onnx campplus.onnx] WAV WAV [WAV ...]
 
+--onnx defaults to CAMPPLUS_ONNX.
+
 Prints every pair's cosine. CAM++ (3D-Speaker, as CosyVoice and Ming-3.0-tts ship it) embeds
 80-bin Kaldi fbank features of 16 kHz audio, mean-normalized over time. Needs onnxruntime and
-torchaudio: the ming-ref .venv has both, and ming-ref/weights holds campplus.onnx.
+torchaudio, and campplus.onnx, which the Ming-3.0-tts checkpoint ships; neither comes with
+Breeze TTS 2.
 """
 import argparse, itertools, os, subprocess
 
@@ -34,7 +37,7 @@ def embed(session, path):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--onnx", default=os.path.expanduser("~/projects/ming-ref/weights/campplus.onnx"))
+    p.add_argument("--onnx", default=os.environ.get("CAMPPLUS_ONNX"), required="CAMPPLUS_ONNX" not in os.environ)
     p.add_argument("wavs", nargs="+")
     args = p.parse_args()
     session = onnxruntime.InferenceSession(args.onnx, providers=["CPUExecutionProvider"])

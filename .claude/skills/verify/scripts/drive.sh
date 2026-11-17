@@ -84,7 +84,7 @@ if has --say && [[ $code -eq 0 && -f "$dir/out.wav" && -z "${BREEZE_VERIFY_NO_AS
         text="$(value_of --say)"
         lang=en
         if printf '%s' "$text" | grep -q '[一-龥]'; then lang=zh; fi
-        "$ASR" --lang "$lang" --max-error 1 "$dir/out.wav" "$text" > "$dir/transcript.txt" 2> "$dir/asr-stderr.txt"
+        "$ASR_PYTHON" "$ASR" --lang "$lang" --max-error 1 "$dir/out.wav" "$text" > "$dir/transcript.txt" 2> "$dir/asr-stderr.txt"
         echo "--- transcript"
         cat "$dir/transcript.txt"
     else

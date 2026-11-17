@@ -44,7 +44,7 @@ fi
 if asr_ready; then
     ok "whisper (tools/asr/transcribe.py, cached MLX weights, ffmpeg): drive.sh will transcribe --say output"
 else
-    warn "no speech recognition: tools/asr/transcribe.py needs openai-whisper and torch in its interpreter, ffmpeg, and mlx-community/whisper-small.en-mlx in the Hugging Face cache; drive.sh will skip transcripts"
+    warn "no speech recognition: tools/asr/transcribe.py needs openai-whisper and torch in \$BREEZE_ASR_PYTHON (default python3), ffmpeg, and mlx-community/whisper-small.en-mlx in the Hugging Face cache; drive.sh will skip transcripts"
 fi
 
 running="$(pgrep -fl "$BIN" || true)"

@@ -1,12 +1,12 @@
-#!/Library/Frameworks/Python.framework/Versions/3.14/bin/python3
+#!/usr/bin/env python3
 # Copyright 2026 Peter Marelas
 # SPDX-License-Identifier: Apache-2.0
 """Transcribe WAVs with Whisper and score them against the text they should say.
 
     tools/asr/transcribe.py [--lang en|zh] [--max-error 0.1] WAV TEXT [WAV TEXT ...]
 
-Needs openai-whisper and torch (the system Python 3.14 has both; the project's .venv has
-neither) and ffmpeg. It reads the MLX Whisper weights already in the Hugging Face cache instead
+Needs a Python with openai-whisper and torch (the project's .venv has neither; run the script
+with an interpreter that has them, as drive.sh does through BREEZE_ASR_PYTHON) and ffmpeg. It reads the MLX Whisper weights already in the Hugging Face cache instead
 of downloading a checkpoint: mlx-community/whisper-small.en-mlx for English and
 mlx-community/whisper-large-v3-turbo for Chinese. MLX stores conv kernels as [out, k, in];
 torch wants [out, in, k], and the MLP layers are named mlp1 and mlp2
