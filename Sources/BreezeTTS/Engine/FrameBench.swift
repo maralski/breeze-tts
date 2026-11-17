@@ -9,6 +9,11 @@ import Metal
 /// share machine noise. A run of frames is committed back to back, as generation does, and a
 /// frame's GPU time is the spacing of completion stamps; the same frames are then run one at a
 /// time with a wait, and split into their two stages for attribution.
+///
+/// BREEZE_FRAME_VARIANTS names kernel schedules to compare in the same process, separated by
+/// ";": "default", or rules "MxNxK=sgSrC" joined by ",", each giving one scalar-projection shape
+/// a `GemvLayout`; "*=sgSrC" gives it to every decode shape, and later rules override it. Every variant runs plain and guided in every round, in alternating order;
+/// BREEZE_FRAME_ONLY=guided (or plain) times that mode alone, for more rounds in the same time.
 public enum FrameBench {
     public struct Options {
         public var rounds = 7
@@ -30,8 +35,24 @@ public enum FrameBench {
         return found.first { FileManager.default.fileExists(atPath: $0.appendingPathComponent(ShardedCheckpoint.indexName).path) }
     }
 
+    /// "default", or "MxNxK=sgSrC,..." rules.
+    static func overrides(_ spec: String) throws -> [GemvShape: GemvLayout] {
+        var out: [GemvShape: GemvLayout] = [:]
+        for rule in spec.split(separator: ",") where rule != "default" {
+            let sides = rule.split(separator: "="), dims = sides[0].split(separator: "x").compactMap { Int($0) }
+            if sides.count == 2, sides[0] == "*", let layout = GemvLayout(String(sides[1])) {
+                for s in GemvBench.shapes { out[GemvShape(m: s.m, n: s.n, k: s.k)] = layout }
+                continue
+            }
+            guard sides.count == 2, dims.count == 3, let layout = GemvLayout(String(sides[1])) else { throw BreezeTTSError.badInput("unknown schedule rule \(rule)") }
+            out[GemvShape(m: dims[0], n: dims[1], k: dims[2])] = layout
+        }
+        return out
+    }
+
     struct Mode {
         let name: String
+        var overrides: [GemvShape: GemvLayout] = [:]
         let settings: FrameSettings
         let loop: FrameLoop
         let positions: [Int]
@@ -57,11 +78,18 @@ public enum FrameBench {
 
         var guided = FrameSettings()
         guided.guidance = o.guidance
-        var modes = [
-            Mode(name: "plain", settings: FrameSettings(), loop: try FrameLoop(ctx: ctx, weights: weights, sequences: 1, maxFrames: o.frames), positions: [o.positions[0]]),
-            Mode(name: "guided", settings: guided, loop: try FrameLoop(ctx: ctx, weights: weights, sequences: 2, maxFrames: o.frames), positions: o.positions),
-        ]
-        for m in modes {
+        let plainLoop = try FrameLoop(ctx: ctx, weights: weights, sequences: 1, maxFrames: o.frames)
+        let guidedLoop = try FrameLoop(ctx: ctx, weights: weights, sequences: 2, maxFrames: o.frames)
+        let specs = (ProcessInfo.processInfo.environment["BREEZE_FRAME_VARIANTS"] ?? "default").split(separator: ";").map(String.init)
+        var modes: [Mode] = []
+        for spec in specs {
+            let rules = try overrides(spec)
+            let tag = specs.count == 1 ? "" : " [\(spec)]"
+            modes.append(Mode(name: "plain" + tag, overrides: rules, settings: FrameSettings(), loop: plainLoop, positions: [o.positions[0]]))
+            modes.append(Mode(name: "guided" + tag, overrides: rules, settings: guided, loop: guidedLoop, positions: o.positions))
+        }
+        defer { Encoder.gemvShapeOverrides = [:] }
+        for m in modes.prefix(2) {
             // Synthetic prompt: every cached key and value the frames will read.
             let kv = m.loop.backbone.cache
             for layer in kv.layers {
@@ -96,8 +124,9 @@ public enum FrameBench {
             m.endOfSpeech = codes.filter { $0[0] == BreezeShape.endOfSpeech }.count
         }
 
+        let only = ProcessInfo.processInfo.environment["BREEZE_FRAME_ONLY"]
         var counts: [(String, DispatchTally)] = []
-        for m in modes {
+        for m in modes.prefix(2) {
             start(m)
             let tally = DispatchTally()
             let cb = ctx.queue.makeCommandBuffer()!
@@ -110,7 +139,8 @@ public enum FrameBench {
         }
 
         for round in 0..<(o.rounds + 1) {
-            for i in (round % 2 == 0 ? [0, 1] : [1, 0]) {
+            for i in (round % 2 == 0 ? Array(modes.indices) : modes.indices.reversed()) where only == nil || modes[i].name.hasPrefix(only!) {
+                Encoder.gemvShapeOverrides = modes[i].overrides
                 // Frames committed back to back.
                 start(modes[i])
                 let w0 = Date()
@@ -161,6 +191,7 @@ public enum FrameBench {
             }
         }
 
+        Encoder.gemvShapeOverrides = [:]
         // What the same number of dispatches costs when each does nothing.
         let dispatches = counts[0].1.dispatches
         var floors: [Double] = []
@@ -176,13 +207,22 @@ public enum FrameBench {
         }
 
         print("\(o.frames) frames per run, median [min-max] of \(o.rounds) interleaved rounds after one warm-up round, \(o.concurrent ? "concurrent encoder with barriers" : "serial encoder"), backbone at positions \(o.positions)")
-        for (m, (_, tally)) in zip(modes, counts) {
+        for (i, m) in modes.enumerated() where !m.gpu.isEmpty {
+            let tally = counts[i % 2].1
             let gb = Double(tally.weightBytes) / 1e9
             print(String(format: "frame %@: gpu %@ ms, wall %@ ms, one-at-a-time wall %@ ms, stages backbone %@ + codes %@ ms",
                          m.name, span(m.gpu), span(m.wall), span(m.syncWall), span(m.backbone), span(m.codes)))
             print(String(format: "  %d dispatches, %.2f GB of weights read, %.0f GB/s over the frame; realtime factor %.2f of an 80 ms frame",
                          tally.dispatches, gb, gb / (median(m.gpu) / 1e3), median(m.gpu) / 80))
-            print("  work check: status clean \(m.statusClean), codes in range \(m.codesInRange), codes identical in every run \(m.codesStable), end-of-speech frames \(m.endOfSpeech) of \(o.frames)")
+            let sameAsFirst = m.firstCodes.map { $0 == modes[i % 2].firstCodes } ?? false
+            if i >= 2 {
+                // Each round runs every variant once, so a round's difference shares its noise.
+                let first = modes[i % 2]
+                let d = zip(m.gpu, first.gpu).map { $0 - $1 }, c = zip(m.codes, first.codes).map { $0 - $1 }
+                print(String(format: "  against the first variant, per round: gpu %+.2f [%+.2f to %+.2f] ms, faster in %d of %d; codes stage %+.2f [%+.2f to %+.2f] ms, faster in %d of %d",
+                             median(d), d.min()!, d.max()!, d.filter { $0 < 0 }.count, d.count, median(c), c.min()!, c.max()!, c.filter { $0 < 0 }.count, c.count))
+            }
+            print("  work check: status clean \(m.statusClean), codes in range \(m.codesInRange), codes identical in every run \(m.codesStable) and to the first variant's \(sameAsFirst), end-of-speech frames \(m.endOfSpeech) of \(o.frames)")
         }
         // Each kernel that reads no projection weights, alone: as many dispatches as a frame
         // issues, in one command buffer.
@@ -199,7 +239,7 @@ public enum FrameBench {
             }
             print(String(format: "  %@ x%d: %.2f ms per frame, %.1f us each", name.padding(toLength: 26, withPad: " ", startingAt: 0), count, median(t), median(t) / Double(count) * 1e3))
         }
-        for m in modes {
+        for m in modes.prefix(2) {
             let l = m.loop, B = l.sequences, bb = weights.backbone.config, dd = weights.depth.config
             print("kernels without projection weights, \(m.name):")
             let bw = l.backbone.work, dw = l.depth.work
@@ -228,6 +268,29 @@ public enum FrameBench {
                 e.sample(i == 0 ? .backbone : .depth, logits: ActView(l.logits, ld: FrameLoop.logitsStride), guidance: m.settings.guidance, settings: SamplerSettings(),
                          uniforms: l.uniforms, uniformsOffset: 0, codes: l.codes, codesOffset: 0, slot: i, seen: l.seen, status: l.status)
             }
+        }
+        // Where a guided frame's time goes, dispatch by dispatch.
+        if ProcessInfo.processInfo.environment["BREEZE_TRACE"] != nil {
+            let m = modes[1], traced = 4
+            start(m)
+            var rows: [String: DispatchTrace.Row] = [:]
+            for f in 0..<traced {
+                let cb = ctx.queue.makeCommandBuffer()!
+                guard let trace = try DispatchTrace(ctx: ctx, commandBuffer: cb, capacity: 2 * dispatches) else { break }
+                let e = Encoder(k: kernels, trace: trace)
+                m.loop.encodeFrame(e, frame: f, settings: m.settings)
+                e.ce.endEncoding()
+                cb.commit()
+                try finish(cb)
+                if f == 0 { continue }
+                for r in try trace.rows() {
+                    let key = "\(r.kernel) \(r.weightBytes)"
+                    rows[key, default: DispatchTrace.Row(kernel: r.kernel, weightBytes: r.weightBytes)].count += r.count
+                    rows[key]!.seconds += r.seconds
+                }
+            }
+            print("guided frame traced, one pass per dispatch (rows scaled to the traced frame's span, which pass boundaries lengthen):")
+            print(DispatchTrace.report(rows.values.sorted { $0.seconds > $1.seconds }, frames: traced - 1))
         }
         print(String(format: "empty-dispatch floor: %d dispatches take %.2f ms (%.2f us each)", dispatches, median(floors), median(floors) / Double(dispatches) * 1e3))
     }

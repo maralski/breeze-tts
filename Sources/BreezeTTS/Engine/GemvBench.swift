@@ -28,18 +28,18 @@ public enum GemvBench {
         Shape(label: "codebook head", m: m, n: 2051, k: 1024, flags: []),
     ] }
 
-    /// "sgN": N output columns per threadgroup of the scalar kernel. "gemm8": the matrix-unit
-    /// kernel even at one or two rows.
+    /// A `GemvLayout` spec ("sgN", "sgNrC"), or "gemm8": the matrix-unit kernel even at one or
+    /// two rows.
     struct Variant {
         let label: String
-        var simdgroups = 4
+        var layout = GemvLayout.shipped
         var scalarRowsMax = 2
 
         init(_ spec: String) throws {
             label = spec
-            if spec == "gemm8" { scalarRowsMax = 0 } else if spec.hasPrefix("sg"), let v = Int(spec.dropFirst(2)), [1, 2, 4, 8, 16].contains(v) { simdgroups = v } else {
-                throw BreezeTTSError.badInput("unknown bench variant \(spec)")
-            }
+            if spec == "gemm8" { scalarRowsMax = 0; return }
+            guard let l = GemvLayout(spec) else { throw BreezeTTSError.badInput("unknown bench variant \(spec)") }
+            layout = l
         }
     }
 
@@ -72,11 +72,11 @@ public enum GemvBench {
         }
         print(String(format: "%d dispatches per shape, median of %d interleaved command buffers, us per dispatch (GB/s of weights); empty dispatch floor %.1f us", repeats, rounds, floors.sorted()[rounds / 2]))
         print("shape              M     N     K    MB  " + variants.map { $0.label.padding(toLength: 18, withPad: " ", startingAt: 0) }.joined())
-        defer { Encoder.gemvSimdgroups = 4; Encoder.scalarRowsMax = 2 }
+        defer { Encoder.gemvLayoutOverride = nil; Encoder.scalarRowsMax = 2 }
         for s in shapes {
             func encodeAll(_ v: Variant) -> (Encoder) -> Void {
                 return { e in
-                    Encoder.gemvSimdgroups = v.simdgroups
+                    Encoder.gemvLayoutOverride = v.layout
                     Encoder.scalarRowsMax = v.scalarRowsMax
                     var offset = 0
                     for _ in 0..<repeats {

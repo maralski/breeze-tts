@@ -12,7 +12,8 @@ final class LinearTests: GPUTestCase {
     static func geluTanh(_ v: Float) -> Float { 0.5 * v * (1 + tanh(0.7978845608 * (v + 0.044715 * v * v * v))) }
     static func silu(_ v: Float) -> Float { v / (1 + exp(-v)) }
 
-    func linearCase(m: Int, n: Int, k: Int, flags: GemvFlags = [], bias: Bool = false, xScale: Float = 1) throws {
+    @discardableResult
+    func linearCase(m: Int, n: Int, k: Int, flags: GemvFlags = [], bias: Bool = false, xScale: Float = 1) throws -> [Float] {
         var rng = RNG(state: UInt64(m * 1000 + n * 7 + k))
         // Rows past m hold NaN: the kernel must never read them.
         let x = rng.floats(m * k, scale: xScale) + [Float](repeating: .nan, count: 8 * k)
@@ -39,7 +40,9 @@ final class LinearTests: GPUTestCase {
                 want[r * n + c] = v
             }
         }
-        assertClose(yb.floats(count: m * n), want, atol: 2e-4 * Float(k).squareRoot() / 30, "linear m\(m) n\(n) k\(k) flags \(flags.rawValue) bias \(bias)")
+        let got = yb.floats(count: m * n)
+        assertClose(got, want, atol: 2e-4 * Float(k).squareRoot() / 30, "linear m\(m) n\(n) k\(k) flags \(flags.rawValue) bias \(bias)")
+        return got
     }
 
     /// The gemm8 kernel assumes this lane-to-element layout of simdgroup_float8x8.
@@ -91,14 +94,32 @@ final class LinearTests: GPUTestCase {
         try linearCase(m: 1, n: 37, k: 64, bias: true)
     }
 
-    /// Every simdgroup count the scalar kernel can be dispatched with gives the same result.
-    func testGemvSimdgroupCounts() throws {
-        defer { Encoder.gemvSimdgroups = 4 }
-        for sg in [1, 2, 8] {
-            Encoder.gemvSimdgroups = sg
-            try linearCase(m: 2, n: 2051, k: 1024, flags: .accumulate)
-            try linearCase(m: 1, n: 1030, k: 1152, flags: .siluGate)
+    /// Every layout the scalar kernel can be dispatched with gives the bits of the first one it
+    /// shipped with, N tails included: a layout changes which simdgroup computes a column, never
+    /// a sum.
+    func testGemvLayoutsAreBitIdentical() throws {
+        defer { Encoder.gemvLayoutOverride = nil }
+        let cases: [(m: Int, n: Int, k: Int, flags: GemvFlags, bias: Bool)] = [
+            (2, 2051, 1024, .accumulate, false), (1, 1030, 1152, .siluGate, false), (2, 1024, 8192, .accumulate, false), (1, 37, 64, [], true),
+        ]
+        for c in cases {
+            Encoder.gemvLayoutOverride = .fourSimdgroups
+            let want = try linearCase(m: c.m, n: c.n, k: c.k, flags: c.flags, bias: c.bias)
+            for sg in GemvLayout.simdgroupChoices {
+                for columns in Kernels.gemvColumns {
+                    Encoder.gemvLayoutOverride = GemvLayout(simdgroups: sg, columns: columns)
+                    let got = try linearCase(m: c.m, n: c.n, k: c.k, flags: c.flags, bias: c.bias)
+                    XCTAssertEqual(got.map(\.bitPattern), want.map(\.bitPattern), "m\(c.m) n\(c.n) k\(c.k) sg\(sg) columns \(columns)")
+                }
+            }
         }
+    }
+
+    func testGemvLayoutSpecs() {
+        XCTAssertEqual(GemvLayout("sg16r2"), GemvLayout(simdgroups: 16, columns: 2))
+        XCTAssertEqual(GemvLayout("sg1"), GemvLayout(simdgroups: 1, columns: 1))
+        XCTAssertNil(GemvLayout("sg3"))
+        XCTAssertNil(GemvLayout("sg4r3"))
     }
 
     /// 3 to 15 rows take the matrix-unit kernel: the 4 rows of a guided depth prefill, and its

@@ -34,11 +34,13 @@ extension ShaderSource {
     """#
 
     // Y[M,N] = X[M,K] * W[N,K]^T with an epilogue, for M <= 2 rows: a decode token, or the two
-    // sequences of a guided step sharing one read of the weights. One simdgroup per output column,
-    // p.sg of them per threadgroup, lanes stride K by 8 bf16 (16 bytes), MR rows of X share every
-    // weight load. Any N; K a multiple of 8. With a gate flag the epilogue is act(x W^T) * (x W2^T). The matrix-unit kernel below wastes 8/M of its multiply-accumulates at tiny M, which
-    // costs more than these M scalar FMAs per weight. Grid y walks M in MR-row chunks; rows past M are
-    // never read.
+    // sequences of a guided step sharing one read of the weights. A simdgroup computes NR output
+    // columns, p.sg simdgroups make a threadgroup, lanes stride K by 8 bf16 (16 bytes). MR rows of
+    // X share every weight load and NR weight rows share every load of X; a column's sum is the
+    // same whatever NR and p.sg are. Any N; K a multiple of 8. With a gate flag the epilogue is
+    // act(x W^T) * (x W2^T). The matrix-unit kernel below wastes 8/M of its multiply-accumulates
+    // at tiny M, which costs more than these M scalar FMAs per weight. Grid y walks M in MR-row
+    // chunks; rows past M are never read.
     static let gemv = #"""
     struct GemvParams { uint M; uint N; uint K; uint ldx; uint ldy; uint flags; uint sg; };
     constant uint GEMV_BIAS = 1;
@@ -51,7 +53,7 @@ extension ShaderSource {
 
     inline float gate_act(float v, uint flags) { return (flags & GEMV_GELU_GATE) ? gelu_tanh(v) : silu(v); }
 
-    template <int MR>
+    template <int MR, int NR>
     kernel void gemv_kernel(device const float* X [[buffer(0)]],
                             device const ushort* W [[buffer(1)]],
                             device const ushort* W2 [[buffer(2)]],
@@ -61,58 +63,90 @@ extension ShaderSource {
                             uint2 tgid [[threadgroup_position_in_grid]],
                             uint sgid [[simdgroup_index_in_threadgroup]],
                             uint lane [[thread_index_in_simdgroup]]) {
-        const uint n = tgid.x * p.sg + sgid;
-        if (n >= p.N) return;
+        const uint n0 = (tgid.x * p.sg + sgid) * NR;
+        if (n0 >= p.N) return;
         const uint row0 = tgid.y * MR;
         const uint rows = min(uint(MR), p.M - row0);
         device const float* x = X + row0 * p.ldx;
-        device const ushort* w = W + n * p.K;
-        device const ushort* w2 = W2 + n * p.K;
-        const bool gated = (p.flags & GEMV_GATED) != 0;
-        float acc[MR], acc2[MR];
+        // Columns past N read the last column's weights and are never written.
+        device const ushort* w[NR];
+        device const ushort* w2[NR];
         #pragma clang loop unroll(full)
-        for (int m = 0; m < MR; m++) { acc[m] = 0.0f; acc2[m] = 0.0f; }
+        for (int r = 0; r < NR; r++) {
+            const uint n = min(n0 + r, p.N - 1);
+            w[r] = W + n * p.K;
+            w2[r] = W2 + n * p.K;
+        }
+        const bool gated = (p.flags & GEMV_GATED) != 0;
+        float acc[NR][MR], acc2[NR][MR];
+        #pragma clang loop unroll(full)
+        for (int r = 0; r < NR; r++) {
+            #pragma clang loop unroll(full)
+            for (int m = 0; m < MR; m++) { acc[r][m] = 0.0f; acc2[r][m] = 0.0f; }
+        }
         for (uint k = lane * 8; k < p.K; k += 256) {
-            float wf[8];
-            unpack8(*(device const uint4*)(w + k), wf);
-            float wg[8];
-            if (gated) unpack8(*(device const uint4*)(w2 + k), wg);
+            // The rows of X are loaded ahead of the weights, with the row guard on the loads, so
+            // the multiply-adds below run unguarded. With the guard around the multiply-adds
+            // the two-row shapes were slow: 1024 x 8192 read 286 GB/s, and 353 this way.
+            float4 a[MR], b[MR];
             #pragma clang loop unroll(full)
             for (int m = 0; m < MR; m++) {
-                if (uint(m) >= rows) continue;
-                const float4 a = *(device const float4*)(x + m * p.ldx + k);
-                const float4 b = *(device const float4*)(x + m * p.ldx + k + 4);
-                acc[m] += a.x * wf[0] + a.y * wf[1] + a.z * wf[2] + a.w * wf[3]
-                        + b.x * wf[4] + b.y * wf[5] + b.z * wf[6] + b.w * wf[7];
-                if (gated) {
-                    acc2[m] += a.x * wg[0] + a.y * wg[1] + a.z * wg[2] + a.w * wg[3]
-                             + b.x * wg[4] + b.y * wg[5] + b.z * wg[6] + b.w * wg[7];
+                a[m] = 0.0f; b[m] = 0.0f;
+                if (uint(m) < rows) {
+                    a[m] = *(device const float4*)(x + m * p.ldx + k);
+                    b[m] = *(device const float4*)(x + m * p.ldx + k + 4);
+                }
+            }
+            #pragma clang loop unroll(full)
+            for (int r = 0; r < NR; r++) {
+                float wf[8];
+                unpack8(*(device const uint4*)(w[r] + k), wf);
+                float wg[8];
+                if (gated) unpack8(*(device const uint4*)(w2[r] + k), wg);
+                #pragma clang loop unroll(full)
+                for (int m = 0; m < MR; m++) {
+                    acc[r][m] += a[m].x * wf[0] + a[m].y * wf[1] + a[m].z * wf[2] + a[m].w * wf[3]
+                               + b[m].x * wf[4] + b[m].y * wf[5] + b[m].z * wf[6] + b[m].w * wf[7];
+                    if (gated) {
+                        acc2[r][m] += a[m].x * wg[0] + a[m].y * wg[1] + a[m].z * wg[2] + a[m].w * wg[3]
+                                    + b[m].x * wg[4] + b[m].y * wg[5] + b[m].z * wg[6] + b[m].w * wg[7];
+                    }
                 }
             }
         }
         #pragma clang loop unroll(full)
-        for (int m = 0; m < MR; m++) {
-            acc[m] = simd_sum(acc[m]);
-            if (gated) acc2[m] = simd_sum(acc2[m]);
+        for (int r = 0; r < NR; r++) {
+            #pragma clang loop unroll(full)
+            for (int m = 0; m < MR; m++) {
+                acc[r][m] = simd_sum(acc[r][m]);
+                if (gated) acc2[r][m] = simd_sum(acc2[r][m]);
+            }
         }
         if (lane != 0) return;
-        const float bval = (p.flags & GEMV_BIAS) ? bf16_to_float(bias[n]) : 0.0f;
         #pragma clang loop unroll(full)
-        for (int m = 0; m < MR; m++) {
-            if (uint(m) < rows) {
-                float v = acc[m] + bval;
-                if (gated) v = gate_act(v, p.flags) * acc2[m];
-                if (p.flags & GEMV_GELU) v = gelu_tanh(v);
-                if (p.flags & GEMV_SILU) v = silu(v);
-                device float* y = Y + (row0 + m) * p.ldy + n;
-                if (p.flags & GEMV_ACCUM) v += *y;
-                *y = v;
+        for (int r = 0; r < NR; r++) {
+            const uint n = n0 + r;
+            if (n >= p.N) continue;
+            const float bval = (p.flags & GEMV_BIAS) ? bf16_to_float(bias[n]) : 0.0f;
+            #pragma clang loop unroll(full)
+            for (int m = 0; m < MR; m++) {
+                if (uint(m) < rows) {
+                    float v = acc[r][m] + bval;
+                    if (gated) v = gate_act(v, p.flags) * acc2[r][m];
+                    if (p.flags & GEMV_GELU) v = gelu_tanh(v);
+                    if (p.flags & GEMV_SILU) v = silu(v);
+                    device float* y = Y + (row0 + m) * p.ldy + n;
+                    if (p.flags & GEMV_ACCUM) v += *y;
+                    *y = v;
+                }
             }
         }
     }
 
-    template [[host_name("gemv_1")]] kernel void gemv_kernel<1>(device const float*, device const ushort*, device const ushort*, device const ushort*, device float*, constant GemvParams&, uint2, uint, uint);
-    template [[host_name("gemv_2")]] kernel void gemv_kernel<2>(device const float*, device const ushort*, device const ushort*, device const ushort*, device float*, constant GemvParams&, uint2, uint, uint);
+    #define GEMV_INSTANCE(MR, NR) template [[host_name("gemv_" #MR "_" #NR)]] kernel void gemv_kernel<MR, NR>(device const float*, device const ushort*, device const ushort*, device const ushort*, device float*, constant GemvParams&, uint2, uint, uint);
+    GEMV_INSTANCE(1, 1) GEMV_INSTANCE(1, 2)
+    GEMV_INSTANCE(2, 1) GEMV_INSTANCE(2, 2)
+    #undef GEMV_INSTANCE
 
     // Matrix-unit GEMV for M <= 8 rows per chunk: Y^T[n, m] = sum_k W[n, k] X[m, k] as 8x8 simdgroup
     // matrix products, so a lane issues one 16-byte weight load and four multiply-accumulates per

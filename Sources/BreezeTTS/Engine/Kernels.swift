@@ -32,6 +32,38 @@ struct GemvFlags: OptionSet {
     var isGated: Bool { !isDisjoint(with: [.siluGate, .geluGate]) }
 }
 
+/// A projection as the scalar kernel sees it: rows of x, output columns, K.
+struct GemvShape: Hashable {
+    let m, n, k: Int
+}
+
+/// How the scalar projection kernel covers a shape: simdgroups per threadgroup, and output
+/// columns per simdgroup (one load of x feeds that many weight rows). Neither changes a sum, so
+/// every layout gives the same bits.
+struct GemvLayout: Hashable {
+    var simdgroups: Int
+    var columns: Int
+    static let simdgroupChoices = [1, 2, 4, 8, 16, 32]
+    /// MingTTS's layout, the one this engine started with.
+    static let fourSimdgroups = GemvLayout(simdgroups: 4, columns: 1)
+    /// The layout every shape takes unless overridden.
+    static let shipped = fourSimdgroups
+
+    init(simdgroups: Int, columns: Int) {
+        self.simdgroups = simdgroups
+        self.columns = columns
+    }
+
+    /// "sgN" or "sgNrC".
+    init?(_ spec: String) {
+        let parts = spec.dropFirst(2).split(separator: "r").compactMap { Int($0) }
+        guard spec.hasPrefix("sg"), let sg = parts.first, Self.simdgroupChoices.contains(sg), parts.count <= 2 else { return nil }
+        let columns = parts.count == 2 ? parts[1] : 1
+        guard Kernels.gemvColumns.contains(columns) else { return nil }
+        self.init(simdgroups: sg, columns: columns)
+    }
+}
+
 /// An fp32 activation matrix view: rows of floats at `offset` bytes, row stride `ld` floats.
 struct ActView {
     let buffer: MTLBuffer
@@ -117,7 +149,10 @@ final class DispatchTally {
 /// The compiled pipelines, resolved once.
 final class Kernels: @unchecked Sendable {
     let ctx: MetalContext
-    let gemv: [Int: MTLComputePipelineState]
+    /// Scalar GEMV variants by (rows of x per simdgroup, output columns per simdgroup).
+    struct GV: Hashable { let mr, nr: Int }
+    static let gemvColumns = [1, 2]
+    let gemv: [GV: MTLComputePipelineState]
     /// gemm8 variants by (K split, column tiles).
     struct G8: Hashable { let ks, nc: Int }
     static let gemm8Variants = [G8(ks: 4, nc: 1), G8(ks: 4, nc: 2), G8(ks: 4, nc: 4), G8(ks: 8, nc: 1), G8(ks: 8, nc: 2), G8(ks: 8, nc: 4), G8(ks: 16, nc: 1), G8(ks: 16, nc: 2)]
@@ -130,8 +165,10 @@ final class Kernels: @unchecked Sendable {
 
     init(ctx: MetalContext) throws {
         self.ctx = ctx
-        var g: [Int: MTLComputePipelineState] = [:]
-        for mr in [1, 2] { g[mr] = try ctx.pipeline("gemv_\(mr)") }
+        var g: [GV: MTLComputePipelineState] = [:]
+        for mr in [1, 2] {
+            for nr in Kernels.gemvColumns { g[GV(mr: mr, nr: nr)] = try ctx.pipeline("gemv_\(mr)_\(nr)") }
+        }
         gemv = g
         var g8: [G8: MTLComputePipelineState] = [:]
         for v in Kernels.gemm8Variants { g8[v] = try ctx.pipeline("gemm8_\(v.ks)_\(v.nc)") }
@@ -170,9 +207,11 @@ final class Kernels: @unchecked Sendable {
 /// a `parallel` group, which the caller promises touch disjoint buffers.
 final class Encoder {
     let k: Kernels
-    let ce: MTLComputeCommandEncoder
+    /// The pass the next dispatch goes to. A traced encoder replaces it at every dispatch.
+    private(set) var ce: MTLComputeCommandEncoder
     let fenced: Bool
     let tally: DispatchTally?
+    private let trace: DispatchTrace?
     private var inGroup = false
     private var groupStarted = false
 
@@ -181,6 +220,16 @@ final class Encoder {
         self.ce = ce
         self.fenced = fenced
         self.tally = tally
+        trace = nil
+    }
+
+    /// Every dispatch in a compute pass of its own, timed by `trace`.
+    init(k: Kernels, trace: DispatchTrace) {
+        self.k = k
+        ce = trace.idlePass()
+        fenced = false
+        tally = nil
+        self.trace = trace
     }
 
     /// Dispatches encoded in `body` may run at the same time.
@@ -193,6 +242,10 @@ final class Encoder {
 
     private func begin(_ pipeline: MTLComputePipelineState, weightBytes: Int = 0) {
         tally?.add(weightBytes: weightBytes)
+        if let trace {
+            ce.endEncoding()
+            ce = trace.pass(for: pipeline, weightBytes: weightBytes)
+        }
         if fenced && !(inGroup && groupStarted) { ce.memoryBarrier(scope: .buffers) }
         if inGroup { groupStarted = true }
         ce.setComputePipelineState(pipeline)
@@ -228,8 +281,13 @@ final class Encoder {
 
     /// Row counts up to this take the scalar kernel. Overridable for the micro-bench.
     nonisolated(unsafe) static var scalarRowsMax = 2
-    /// Output columns (simdgroups) per threadgroup of the scalar kernel. Overridable for the micro-bench.
-    nonisolated(unsafe) static var gemvSimdgroups = 4
+    /// Forces one scalar-kernel layout for every shape: the micro-bench's and the tests' knob.
+    nonisolated(unsafe) static var gemvLayoutOverride: GemvLayout?
+    /// Layouts for single shapes, ahead of the rule: the frame bench's knob.
+    nonisolated(unsafe) static var gemvShapeOverrides: [GemvShape: GemvLayout] = [:]
+    static func gemvLayout(_ shape: GemvShape) -> GemvLayout {
+        gemvLayoutOverride ?? gemvShapeOverrides[shape] ?? .shipped
+    }
     /// Simdgroups sharing one (row, KV head) of the backbone attention at decode. Measured at 300
     /// cached keys on an M3 Max: 81 us per dispatch with one, 34 with four, 22 with eight.
     /// Overridable for the micro-bench.
@@ -254,9 +312,11 @@ final class Encoder {
             threads = 128
         } else if m <= Encoder.scalarRowsMax {
             precondition(linear.k % 8 == 0, "gemv needs K % 8 == 0, got \(linear.k)")
-            sg = Encoder.gemvSimdgroups
-            begin(k.gemv[m]!, weightBytes: weights * (gate == nil ? 1 : 2))
-            groups = MTLSize(width: (linear.n + sg - 1) / sg, height: 1, depth: 1)
+            let layout = Encoder.gemvLayout(GemvShape(m: m, n: linear.n, k: linear.k))
+            sg = layout.simdgroups
+            let nr = layout.columns
+            begin(k.gemv[Kernels.GV(mr: m, nr: nr)]!, weightBytes: weights * (gate == nil ? 1 : 2))
+            groups = MTLSize(width: (linear.n + sg * nr - 1) / (sg * nr), height: 1, depth: 1)
             threads = 32 * sg
         } else {
             let ks = Encoder.kSplit(forK: linear.k), nc = Encoder.columnTiles(forN: linear.n, k: linear.k)
