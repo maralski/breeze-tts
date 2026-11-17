@@ -10,13 +10,18 @@ import XCTest
 final class ParityTests: XCTestCase {
     nonisolated(unsafe) static var parity: BreezeParity?
 
-    func check(_ name: String) throws {
+    func harness() throws -> (BreezeParity, URL) {
         let env = ProcessInfo.processInfo.environment
         guard let goldens = env["BREEZE_GOLDENS"] else { throw XCTSkip("set BREEZE_GOLDENS to run the parity tests") }
         guard let weights = FrameBench.defaultWeights(environment: env) else { throw XCTSkip("no Breeze-TTS-2 checkpoint") }
         let parity = try Self.parity ?? BreezeParity(weights: weights)
         Self.parity = parity
-        let dir = URL(fileURLWithPath: goldens).appendingPathComponent(name)
+        return (parity, URL(fileURLWithPath: goldens))
+    }
+
+    func check(_ name: String) throws {
+        let (parity, goldens) = try harness()
+        let dir = goldens.appendingPathComponent(name)
         guard FileManager.default.fileExists(atPath: dir.path) else { throw XCTSkip("no \(name) goldens") }
         let report = try parity.run(caseDirectory: dir)
         for line in report.tensors where !line.passed { XCTFail(line.description) }
@@ -31,6 +36,49 @@ final class ParityTests: XCTestCase {
     func testDirectionEnglish() throws { try check("direction_en") }
     /// One 337-token segment from tools/reference/make_long_text_golden.py: the sliding window.
     func testLongTextEncoder() throws { try check("long_text") }
+
+    /// The golden prompts are all shorter than `Kernels.gemmMinRows`; this runs one through the
+    /// tiled GEMM that longer prompts take.
+    func testDirectionThroughTiledGemm() throws {
+        let saved = Kernels.gemmMinRows
+        Kernels.gemmMinRows = 16
+        defer { Kernels.gemmMinRows = saved }
+        try check("direction_en")
+    }
+
+    /// The seeded uniforms give the same codes run after run, to end of speech.
+    func testSeededRunRepeats() throws {
+        let (parity, goldens) = try harness()
+        let prompt = try GoldenCase(directory: goldens.appendingPathComponent("design_en")).referencePrompt()
+        var options = SynthesisOptions()
+        options.uniforms = .seeded(7)
+        options.maxFrames = 300
+        var runs: [[[Int]]] = []
+        for _ in 0..<2 {
+            var codes: [[Int]] = []
+            let report = try parity.synth.run(prompt, options: options) { codes.append($0) }
+            XCTAssertTrue(report.stoppedOnEndOfSpeech)
+            XCTAssertEqual(report.frames, codes.count)
+            XCTAssertEqual(report.frameSeconds.count, codes.count)
+            runs.append(codes)
+        }
+        XCTAssertGreaterThan(runs[0].count, 10)
+        XCTAssertEqual(runs[0], runs[1])
+    }
+
+    /// A prompt of 2040 positions leaves the backbone room for 7 frames (the reference stops
+    /// before position 2047).
+    func testPositionLimitStopsGeneration() throws {
+        let (parity, _) = try harness()
+        var rng = SplitMix64(seed: 3)
+        let ids = [Int32(2)] + (1..<2040).map { _ in Int32(3 + rng.next() % 200_000) }
+        var options = SynthesisOptions()
+        options.greedy = true
+        var frames = 0
+        let report = try parity.synth.run(BreezePrompt(positive: .init(segments: [.text(ids)]), guidance: nil), options: options) { _ in frames += 1 }
+        XCTAssertLessThanOrEqual(frames, 7)
+        XCTAssertTrue(report.stoppedOnEndOfSpeech || frames == 7, "\(frames) frames, stopped \(report.stoppedOnEndOfSpeech)")
+    }
 
     /// The comparison the whole report rests on must fail a zeroed row and a NaN.
     func testComparisonCatchesBrokenRows() {

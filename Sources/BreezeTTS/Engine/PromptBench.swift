@@ -24,6 +24,31 @@ public enum PromptBench {
         struct Row { var encoder: [Double] = [], attention: [Double] = [], prefill: [Double] = [], plain: [Double] = [], guided: [Double] = [], guidedPrefill: [Double] = [] }
         var rows = [Row](repeating: Row(), count: lengths.count)
         var nonFinite = 0, stoppedAtOnce = 0
+        // The GEMM row cut: each length under each cut, alternating within a round.
+        if let cuts = ProcessInfo.processInfo.environment["BREEZE_GEMM_CUTS"]?.split(separator: ",").compactMap({ Int($0) }) {
+            let saved = Kernels.gemmMinRows
+            defer { Kernels.gemmMinRows = saved }
+            var times = [[Double]](repeating: [], count: lengths.count * cuts.count)
+            for round in 0...rounds {
+                for (i, n) in lengths.enumerated() {
+                    let segment = ids(n)
+                    try synth.embedding.gather(segment, into: synth.encoderInput.contents().bindMemory(to: Float.self, capacity: n * c.hidden))
+                    let layout = PromptLayout(BreezePrompt(positive: .init(segments: [.text(segment)]), guidance: nil))
+                    for (j, cut) in (round % 2 == 0 ? Array(cuts.enumerated()) : cuts.enumerated().reversed()) {
+                        Kernels.gemmMinRows = cut
+                        let t = try gpu { e in
+                            synth.text.encode(e, x: ActView(synth.encoderInput, ld: c.hidden), rows: n, out: synth.inputRows(0))
+                            synth.encodePrefill(e, layout, loop: loop, prefill: prefill)
+                        }
+                        if round > 0 { times[i * cuts.count + j].append(t) }
+                    }
+                }
+            }
+            for (i, n) in lengths.enumerated() {
+                print("\(n) tokens, encoder + prefill gpu ms by GEMM cut: " + cuts.enumerated().map { j, cut in "\(cut): \(FrameBench.span(times[i * cuts.count + j]))" }.joined(separator: ", "))
+            }
+            return
+        }
         for round in 0...rounds {
             for (i, n) in (round % 2 == 0 ? Array(lengths.enumerated()) : lengths.enumerated().reversed()) {
                 let segment = ids(n)

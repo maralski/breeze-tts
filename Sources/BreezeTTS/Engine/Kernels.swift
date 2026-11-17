@@ -152,8 +152,11 @@ final class Kernels: @unchecked Sendable {
 
     /// The tiled GEMM takes over at this many rows (prefill), when the shape tiles. Below it
     /// gemm8's 8-row chunks give the GPU more threadgroups: measured on an M3 Max over prompt
-    /// encoding and prefill, gemm8 is 3.5x faster at 16 rows, 10% at 128, and 5% slower at 192.
-    static let gemmMinRows = 160
+    /// encoding plus prefill (`--bench-prompt` with BREEZE_GEMM_CUTS), gemm8 takes 66 ms
+    /// against 81 at 96 rows and 130 against 138 at 192; at 256 the two tie, and from 320 rows
+    /// the GEMM wins (576 against 676 ms at 768). Overridable for the bench and the parity test
+    /// of the GEMM path.
+    nonisolated(unsafe) static var gemmMinRows = 256
     /// Prefill blocks at least this tall give each (row, KV head) of the causal attention one simdgroup.
     static let prefillAttentionRows = 16
     static let gemmBM = 32, gemmBN = 64, gemmBK = 32
