@@ -76,7 +76,7 @@ Every tensor file is raw little-endian, row-major, with no header. `.f32` files 
 
 `B` is the number of branches: 2 with CFG (row 0 cond, row 1 uncond), otherwise 1. `L` is the segment length in tokens, `S` the branch prompt length, `N` the number of frames, and `M` the number of backbone sampling steps. `M = N + 1` when the run stopped on EOS, and the last step is the one that produced EOS.
 
-**Text encoder.** One set per branch and text segment, with names `text_<branch>_seg<i>_<stage>`. Each segment runs alone at batch 1 with positions `0..L-1`. These rows equal the reference's own bucketed batch exactly (max diff 0 in every case).
+**Text encoder.** One set per branch and text segment, with names `text_<branch>_seg<i>_<stage>`. Each segment runs alone at batch 1 with positions `0..L-1`. In fp32 the projected rows equal the reference's own bucketed, right-padded batch exactly. In bf16 they differ by up to 0.125 when two segments share a padded bucket (clone and direction), because the padded matmul shapes round differently.
 
 | stage | shape | meaning |
 |---|---|---|
@@ -94,7 +94,7 @@ Every tensor file is raw little-endian, row-major, with no header. `.f32` files 
 | `final_norm` | [S, 2048] | `last_hidden_state` |
 | `last_logits` | [2052] | `lm_head(final_norm[-1])` in fp32 |
 
-The reference stream itself batches cond and uncond with left padding. Its prefill logits (`greedy_backbone_logits[0]`) differ from the unpadded ones by at most 2.7e-5 in fp32. See `prefill_last_logits_max_abs_unpadded_vs_batched`.
+The reference stream itself batches cond and uncond with left padding. Its prefill logits (`greedy_backbone_logits[0]`) differ from the unpadded ones by at most 2.7e-5 in fp32 and by up to 0.032 in bf16 (design_en uncond, 19 pad rows). See `prefill_last_logits_max_abs_unpadded_vs_batched`.
 
 **Streams.** The prefix is `greedy_` or `sampled_`. In greedy mode both samplers run with `do_sample=False`, so the backbone takes the argmax after the repetition penalty and suppression, and the depth decoder takes the argmax of the CFG-combined logits after suppression.
 
@@ -119,7 +119,10 @@ In fp32, `*_token_own` equals `codes`. In bf16 it is what bf16 would have chosen
 cdf    = cumsum(float64(p))          # p is the float32 probability row
 target = float64(u) * cdf[-1]
 token  = first i with cdf[i] > target   # strict; zero-probability tokens are never chosen
+         (if no i qualifies: the last i with p[i] > 0; no stored u reaches 1.0, so this never fired)
 ```
+
+`check_goldens.py` replays both samplers in numpy from the stored fp32 tensors: CFG-combined logits, code-0 history, penalty, suppression, temperature, top-k 50 by threshold, softmax and the rule above. It reproduces every greedy and sampled token in all five cases.
 
 The uniforms come from `numpy.random.Generator(PCG64(42))`: `random(121)` for the backbone, then `random((120, 15))` for the depth draws, each rounded to float32. The stored float32 values are the inputs, so a port does not need the generator. Draw order per request is backbone draw 0 after prefill, then for each frame 15 depth draws and one backbone draw. In greedy mode the depth graph still calls the real `torch.multinomial` and discards the result.
 
