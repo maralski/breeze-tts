@@ -182,3 +182,39 @@ final class CodecDecoderParityTests: XCTestCase {
         }
     }
 }
+
+final class CodecEncoderParityTests: XCTestCase {
+    /// The reference clip (a whole number of frames), a clip cut mid-frame with an odd 25 Hz
+    /// length, and an 8.3 s clip: every stage against the reference, codes exactly.
+    func testEncoderMatchesReferenceCodes() throws {
+        let env = try CodecGoldens.require()
+        let ctx = GPUTestCase.ctx
+        let encoder = try CodecEncoder(ctx: ctx, kernels: try CodecKernels(ctx: ctx), weights: try CodecEncoderWeights(try CodecLoader(directory: env.weights, ctx: ctx)), engine: GPUTestCase.kernels)
+        for name in ["clone_en/encoder", "direction_en/encoder", "codec_extra/enc_odd", "codec_extra/enc_long"] {
+            let dir = env.goldens.appendingPathComponent(name)
+            let samples = try CodecGoldens.floats(dir.appendingPathComponent("input_samples.f32"))
+            let want = try CodecGoldens.codes(dir.appendingPathComponent("codes.i32"))
+            let t0 = Date()
+            let got = try encoder.encodeStages(samples: samples)
+            let seconds = Date().timeIntervalSince(t0)
+            XCTAssertEqual(got.codes.count, (samples.count + 1919) / 1920, name)
+            let goldenDown = CodecGoldens.timeMajor(try CodecGoldens.floats(dir.appendingPathComponent("downsample.f32")), channels: 512)
+            for (stage, values, golden) in [("seanet", got.seanet, CodecGoldens.timeMajor(try CodecGoldens.floats(dir.appendingPathComponent("seanet.f32")), channels: 512)),
+                                            ("transformer", got.transformer, try CodecGoldens.floats(dir.appendingPathComponent("transformer.f32"))),
+                                            ("downsample", got.downsample, goldenDown)] {
+                let a = CodecGoldens.compare(values, golden)
+                print(String(format: "encoder parity %@ %@ cosine %.9f maxAbs %.3g peak %.3g", name, stage, a.cosine, a.maxAbs, a.peak))
+                XCTAssertGreaterThanOrEqual(a.cosine, 0.9999, "\(name) \(stage)")
+                XCTAssertLessThanOrEqual(a.maxAbs, 2e-4 * a.peak, "\(name) \(stage)")
+            }
+            let fromGolden = try encoder.quantize(embedding: goldenDown)
+            let flatWant = want.flatMap { $0 }
+            let endToEnd = zip(got.codes.flatMap { $0 }, flatWant).filter { Int($0) != $1 }.count
+            let quantizerOnly = zip(fromGolden.flatMap { $0 }, flatWant).filter { Int($0) != $1 }.count
+            print(String(format: "encoder parity %@ %d samples, %d frames in %.3f s: %d of %d codes differ end to end, %d from the reference embedding",
+                         name, samples.count, want.count, seconds, endToEnd, flatWant.count, quantizerOnly))
+            XCTAssertEqual(got.codes.map { $0.map(Int.init) }, want, "\(name) end to end")
+            XCTAssertEqual(fromGolden.map { $0.map(Int.init) }, want, "\(name) quantizer on the reference embedding")
+        }
+    }
+}

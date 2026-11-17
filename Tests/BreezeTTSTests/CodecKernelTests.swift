@@ -435,3 +435,21 @@ final class CodecAttentionTests: CodecTestCase {
         assertRows(out.floats(count: total * width), want, atol: 2e-5, rtol: 1e-4, "full causal")
     }
 }
+
+final class CodecResampleTests: XCTestCase {
+    /// A tone keeps its frequency and level through conversions to 24 kHz, and the output has
+    /// ceil(n * new / orig) samples.
+    func testToneSurvivesRateConversion() {
+        for rate in [48000, 16000, 44100] {
+            let n = rate / 2 + 7
+            let tone = (0..<n).map { Float(0.5 * sin(2 * Double.pi * 440 * Double($0) / Double(rate))) }
+            let out = codecResample(tone, from: rate, to: 24000)
+            XCTAssertEqual(out.count, Int((Double(n) * 24000 / Double(rate)).rounded(.up)), "rate \(rate)")
+            var worst: Float = 0
+            for i in 200..<(out.count - 200) { worst = max(worst, abs(out[i] - Float(0.5 * sin(2 * Double.pi * 440 * Double(i) / 24000)))) }
+            XCTAssertLessThan(worst, 2e-3, "rate \(rate)")
+        }
+        let same = (0..<100).map { Float($0) }
+        XCTAssertEqual(codecResample(same, from: 24000, to: 24000), same)
+    }
+}
