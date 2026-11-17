@@ -144,16 +144,16 @@ Clone requests accept no guidance other than 1. Direction requests take guidance
 
 ## Speed
 
-Generation runs faster than real time on an M3 Max. These numbers come from `breeze-tts --bench` (two invocations of 5 seeded runs each, after one warm-up run) on an M3 Max with a 40-core GPU and 128 GB, macOS 27.0.1, in a release build, measured on 17 November 2026 while other processes (a software update and a virtual machine) loaded the machine:
+Generation runs faster than real time on an M3 Max. These numbers come from `breeze-tts --bench` (two invocations of 5 seeded runs each, after one warm-up run) on an M3 Max with a 40-core GPU and 128 GB, macOS 27.0.1, in a release build, measured on 17 November 2026. Other processes (a virtual machine and system services) loaded the machine, at a load average of 35 to 60 when the runs ended:
 
 | Request | Seconds of audio per second | Time to first audio | Frames per second |
 | --- | --- | --- | --- |
-| Plain, unguided | 1.44 and 1.48 (1.42 to 1.49) | 146 and 148 ms (137 to 166 ms) | 18.5 and 19.0 |
-| Voice design, guidance 4 | 1.34 and 1.33 (1.31 to 1.36) | 215 and 226 ms (208 to 238 ms) | 17.4 and 17.2 |
+| Plain, unguided | 1.43 and 1.50 (1.40 to 1.52) | 106 and 115 ms (100 to 123 ms) | 18.4 and 19.3 |
+| Voice design, guidance 4 | 1.15 and 1.31 (1.11 to 1.35) | 208 and 189 ms (170 to 230 ms) | 14.9 and 17.1 |
 
-Each cell gives the median of each invocation and the range over both. Time to first audio runs from the `synthesize` call to the first 80 ms chunk and includes the text encoding and the prefill. The first request after loading the model takes about 180 ms to first audio for the plain sentence. Under heavier load in the same session, the same benchmark measured as low as 1.24 (plain) and 1.08 (guided) seconds of audio per second.
+Each cell gives the median of each invocation and the range over both. Time to first audio runs from the `synthesize` call to the first 80 ms chunk and includes the text encoding and the prefill. The first request after loading the model is slower, because it also allocates the frame loop: 186 to 289 ms to first audio over three runs of a plain sentence under the same load. At other times that day, the same benchmark measured as low as 1.24 (plain) and 1.08 (guided) seconds of audio per second.
 
-The GPU time of the frame loop sets the speed. Right after these runs, `breeze-tts --bench-frame` measured 44 ms per frame unguided and 49 ms guided, most of it in the depth decoder's 15 sequential steps per frame, and `breeze-tts --bench-codec --token-loop` measured 5 ms more per frame to decode it to audio. An end-to-end frame takes about 5% longer than that GPU work.
+The GPU time of the frame loop sets the speed. Earlier the same day, `breeze-tts --bench-frame` measured 44 ms per frame unguided and 49 ms guided, most of it in the depth decoder's 15 sequential steps per frame, and `breeze-tts --bench-codec --token-loop` measured 5 ms more per frame to decode it to audio. An end-to-end frame takes about 5% longer than that GPU work.
 
 ## Test
 

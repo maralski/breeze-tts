@@ -229,7 +229,10 @@ final class Synthesizer {
 
     /// Generates frames for `prompt` until end of speech, `options.maxFrames`, or the backbone's
     /// position limit, handing each frame's 16 codes to `onFrame` as soon as it completes. Two
-    /// frames are in flight at a time; a frame encoded past the stop is discarded.
+    /// frames are in flight at a time after the first; a frame encoded past the stop is
+    /// discarded. Frame 0 runs alone so its audio is not queued behind frame 1: over three
+    /// interleaved `--bench` rounds that cut time to first audio by about 35 ms with no
+    /// measurable change in throughput.
     ///
     /// With a `decoder`, each frame's codes are decoded on the same queue once the CPU has seen
     /// them, so the end-of-speech frame never reaches the codec, and `onAudio` receives the
@@ -266,7 +269,9 @@ final class Synthesizer {
         defer { for entry in queue { entry.cb.waitUntilCompleted() } }
 
         func topUp() throws {
-            while !finished && encoded < limit && framesInFlight < 2 {
+            // Frame 1 waits for frame 0's codes, so frame 0's decode runs right after it.
+            let depth = done == 0 ? 1 : 2
+            while !finished && encoded < limit && framesInFlight < depth {
                 let f = encoded
                 loop.setUniforms(frame: f, uniforms(f))
                 queue.append((try commit { e in
