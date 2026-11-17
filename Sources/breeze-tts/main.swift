@@ -3,13 +3,14 @@
 // Usage:
 //   breeze-tts --bench-frame [--weights DIR] [--rounds N] [--frames N] [--concurrent] [--guidance S]
 //   breeze-tts --bench-gemv [--repeats N] [--rounds N]
+//   breeze-tts --bench-prompt [--weights DIR] [--rounds N]
 //   breeze-tts --parity CASE_DIR [--weights DIR]   (a case of the reference goldens)
 // --weights defaults to BREEZE_WEIGHTS, then the Hugging Face cache. Run benchmarks under
 // scripts/gpulock.py so they never overlap.
 import BreezeTTS
 import Foundation
 
-enum Mode { case benchFrame, benchGemv, parity(URL) }
+enum Mode { case benchFrame, benchGemv, benchPrompt, parity(URL) }
 
 do {
     var mode: Mode?
@@ -29,6 +30,7 @@ do {
         switch arg {
         case "--bench-frame": mode = .benchFrame
         case "--bench-gemv": mode = .benchGemv
+        case "--bench-prompt": mode = .benchPrompt
         case "--parity": mode = .parity(URL(fileURLWithPath: try value(arg)))
         case "--weights": weights = URL(fileURLWithPath: try value(arg))
         case "--rounds": rounds = try int(arg)
@@ -50,6 +52,12 @@ do {
         try FrameBench.run(directory: dir, options: frame)
     case .benchGemv:
         try GemvBench.run(repeats: repeats, rounds: rounds ?? 5)
+    case .benchPrompt:
+        guard let dir = weights ?? FrameBench.defaultWeights() else {
+            throw BreezeTTSError.badCheckpoint("no checkpoint: pass --weights or set BREEZE_WEIGHTS")
+        }
+        let lengths = ProcessInfo.processInfo.environment["BREEZE_BENCH_LENGTHS"]?.split(separator: ",").compactMap { Int($0) } ?? [60, 400]
+        try PromptBench.run(directory: dir, lengths: lengths, rounds: rounds ?? 7)
     case .parity(let caseDirectory):
         guard let dir = weights ?? FrameBench.defaultWeights() else {
             throw BreezeTTSError.badCheckpoint("no checkpoint: pass --weights or set BREEZE_WEIGHTS")

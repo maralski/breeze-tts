@@ -150,8 +150,12 @@ final class Kernels: @unchecked Sendable {
         sampleDepth = try ctx.pipeline("sample_depth")
     }
 
-    /// The tiled GEMM takes over at this many rows (prefill), when the shape tiles.
-    static let gemmMinRows = 16
+    /// The tiled GEMM takes over at this many rows (prefill), when the shape tiles. Below it
+    /// gemm8's 8-row chunks give the GPU more threadgroups: measured on an M3 Max over prompt
+    /// encoding and prefill, gemm8 is 3.5x faster at 16 rows, 10% at 128, and 5% slower at 192.
+    static let gemmMinRows = 160
+    /// Prefill blocks at least this tall give each (row, KV head) of the causal attention one simdgroup.
+    static let prefillAttentionRows = 16
     static let gemmBM = 32, gemmBN = 64, gemmBK = 32
     static func usesGemm(rows m: Int, n: Int, k: Int) -> Bool {
         m >= gemmMinRows && n % gemmBN == 0 && k % gemmBK == 0
@@ -316,7 +320,7 @@ final class Encoder {
     func attentionCausal(_ q: ActView, block: RowBlock, heads hq: Int, kvHeads hkv: Int, cache: KVCacheLayer, _ out: ActView) {
         struct P { var B, M, hq, hkv, ldq, ldo, cap, seqStride: UInt32; var scale: Float; var pos0: (UInt32, UInt32, UInt32, UInt32) }
         precondition(hq == 2 * hkv, "attention_causal is compiled for two query heads per KV head")
-        let split = block.rows < Kernels.gemmMinRows ? Encoder.causalDecodeSplit : 1
+        let split = block.rows < Kernels.prefillAttentionRows ? Encoder.causalDecodeSplit : 1
         begin(k.attentionCausal[split]!)
         bind(q, 0)
         bind(cache.k, 1)

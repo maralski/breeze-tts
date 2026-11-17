@@ -122,21 +122,24 @@ final class LinearTests: GPUTestCase {
         }
     }
 
-    /// Prefill shapes route through the tiled GEMM (16 rows and up, N % 64 == 0, K % 32 == 0),
-    /// K = 1152 included; a head-shaped N falls back to the matrix-unit kernel.
+    /// Long prefill shapes route through the tiled GEMM (160 rows and up, N % 64 == 0,
+    /// K % 32 == 0), K = 1152 included; a head-shaped N and shorter prompts take the
+    /// matrix-unit kernel.
     func testPrefillShapes() throws {
-        XCTAssertTrue(Kernels.usesGemm(rows: 40, n: 4096, k: 2048))
-        XCTAssertTrue(Kernels.usesGemm(rows: 40, n: 1536, k: 1152))
-        XCTAssertFalse(Kernels.usesGemm(rows: 40, n: 2052, k: 2048))
-        XCTAssertFalse(Kernels.usesGemm(rows: 8, n: 4096, k: 2048))
-        try linearCase(m: 40, n: 4096, k: 2048)
-        try linearCase(m: 33, n: 2048, k: 6144, flags: .accumulate)
-        try linearCase(m: 17, n: 6144, k: 2048, flags: .siluGate)
-        try linearCase(m: 40, n: 1536, k: 1152)
-        try linearCase(m: 21, n: 6912, k: 1152, flags: .geluGate)
-        try linearCase(m: 65, n: 1152, k: 6912, flags: .accumulate)
-        try linearCase(m: 19, n: 2052, k: 2048)
-        try linearCase(m: 16, n: 64, k: 32, flags: .gelu, bias: true)
+        XCTAssertTrue(Kernels.usesGemm(rows: 170, n: 4096, k: 2048))
+        XCTAssertTrue(Kernels.usesGemm(rows: 170, n: 1536, k: 1152))
+        XCTAssertFalse(Kernels.usesGemm(rows: 170, n: 2052, k: 2048))
+        XCTAssertFalse(Kernels.usesGemm(rows: 40, n: 4096, k: 2048))
+        for m in [40, 170] {
+            try linearCase(m: m, n: 4096, k: 2048)
+            try linearCase(m: m - 7, n: 2048, k: 6144, flags: .accumulate)
+            try linearCase(m: m - 23, n: 6144, k: 2048, flags: .siluGate)
+            try linearCase(m: m, n: 1536, k: 1152)
+            try linearCase(m: m - 19, n: 6912, k: 1152, flags: .geluGate)
+            try linearCase(m: m + 25, n: 1152, k: 6912, flags: .accumulate)
+            try linearCase(m: m - 21, n: 2052, k: 2048)
+        }
+        try linearCase(m: 160, n: 64, k: 32, flags: .gelu, bias: true)
     }
 
     /// Pre-activations of tens are normal inside an MLP; tanh must not overflow there.
