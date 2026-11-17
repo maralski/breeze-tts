@@ -23,7 +23,7 @@ final class ReadmeTests: XCTestCase {
             streamed += chunk.count
         }
 
-        var options = SynthesisOptions()
+        var options = BreezeSynthesisOptions()
         options.seed = 7
         let reports = try model.synthesize(request, options: options) { fragment, chunk in
             try Task.checkCancellation()

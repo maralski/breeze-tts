@@ -65,7 +65,7 @@ public enum PromptBench {
                 }
                 let layout = PromptLayout(BreezePrompt(positive: .init(segments: [.text(segment)]), guidance: nil))
                 let pre = try gpu { synth.encodePrefill($0, layout, loop: loop, prefill: prefill) }
-                var plain = SynthesisOptions()
+                var plain = BreezeSynthesisOptions()
                 plain.maxFrames = 1
                 let p = BreezePrompt(positive: .init(segments: [.text(segment)]), guidance: nil)
                 let r1 = try synth.run(p, options: plain) { _ in }

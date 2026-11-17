@@ -43,8 +43,8 @@ import Testing
 }
 
 @Test func optionsRejectSettingsTheSamplerCannotUse() {
-    func rejects(_ change: (inout SynthesisOptions) -> Void) -> Bool {
-        var o = SynthesisOptions()
+    func rejects(_ change: (inout BreezeSynthesisOptions) -> Void) -> Bool {
+        var o = BreezeSynthesisOptions()
         change(&o)
         return (try? o.validate()) == nil
     }
@@ -60,7 +60,7 @@ import Testing
 }
 
 @Test func optionsDefaultToTheReferenceSampling() {
-    let o = SynthesisOptions()
+    let o = BreezeSynthesisOptions()
     #expect(o.guidance == nil && o.maxFrames == 1500 && o.temperature == 0.9 && o.topK == 50 && o.repetitionPenalty == 1.1 && !o.greedy)
     #expect(BreezeTask.plain.recommendedGuidance == 1)
     #expect(BreezeTask.voiceDesign(instruction: "Calm.").recommendedGuidance == 4)

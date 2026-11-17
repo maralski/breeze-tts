@@ -240,7 +240,7 @@ final class Synthesizer {
     /// the codes are read the next frame is already committed, so the decode goes in a command
     /// buffer of its own behind it. Putting it at the head of the frame after next instead
     /// costs about 40 ms more time to first audio and gains no throughput (`--bench`, M3 Max).
-    func run(_ prompt: BreezePrompt, options: SynthesisOptions, decoder: CodecDecoder? = nil, onAudio: ([Float]) throws -> Void = { _ in },
+    func run(_ prompt: BreezePrompt, options: BreezeSynthesisOptions, decoder: CodecDecoder? = nil, onAudio: ([Float]) throws -> Void = { _ in },
              onFrame: ([Int]) throws -> Void) throws -> SynthesisReport {
         let layout = PromptLayout(prompt)
         let (loop, prefill) = try loop(sequences: layout.branches.count)

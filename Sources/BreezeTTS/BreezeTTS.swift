@@ -3,7 +3,7 @@
 import AVFoundation
 import Foundation
 
-public struct SynthesisOptions: Sendable {
+public struct BreezeSynthesisOptions: Sendable {
     /// Classifier-free guidance scale. Nil uses the task's `recommendedGuidance`: 4 for voice
     /// design and voice direction, as the upstream README runs them, and 1 (none) for plain and
     /// clone requests, which have no negative prompt and reject any other value.
@@ -48,7 +48,7 @@ public struct SynthesisOptions: Sendable {
 }
 
 /// What one fragment took.
-public struct GenerationReport: Sendable {
+public struct BreezeGenerationReport: Sendable {
     /// Frames generated, 80 ms of audio each. The end-of-speech frame is not counted.
     public var frames: Int
     /// True when the model ended the utterance; false when it ran to `maxFrames` or the
@@ -103,7 +103,7 @@ public final class BreezeTTSModel: @unchecked Sendable {
 
     /// Streams PCM chunks for `request` as they are decoded, one 80 ms frame at a time.
     /// Cancelling the consuming task stops generation at the next frame.
-    public func stream(_ request: BreezeRequest, options: SynthesisOptions = .init()) -> AsyncThrowingStream<[Float], Error> {
+    public func stream(_ request: BreezeRequest, options: BreezeSynthesisOptions = .init()) -> AsyncThrowingStream<[Float], Error> {
         AsyncThrowingStream { continuation in
             let task = Task.detached(priority: .userInitiated) {
                 do {
@@ -128,13 +128,13 @@ public final class BreezeTTSModel: @unchecked Sendable {
     /// fragment would get a new speaker. When such a request splits, fragment 0's own codes and
     /// text become the reference voice for the rest: a design request continues as a voice
     /// direction (the instruction and the guidance stay), a plain one as a clone.
-    public func synthesize(_ request: BreezeRequest, options: SynthesisOptions = .init(), onChunk: (Int, [Float]) throws -> Void) throws -> [GenerationReport] {
+    public func synthesize(_ request: BreezeRequest, options: BreezeSynthesisOptions = .init(), onChunk: (Int, [Float]) throws -> Void) throws -> [BreezeGenerationReport] {
         try options.validate()
         let fragments = request.fragments(maxLength: options.fragmentLength)
         lock.lock()
         defer { lock.unlock() }
         var request = request
-        var reports: [GenerationReport] = []
+        var reports: [BreezeGenerationReport] = []
         for (index, fragment) in fragments.enumerated() {
             let prompt = try BreezePrompt(fragment: fragment, of: request, guidance: options.guidance ?? request.task.recommendedGuidance, tokenizer: tokenizer)
             let carries = index == 0 && fragments.count > 1 && request.task.reference == nil
@@ -145,7 +145,7 @@ public final class BreezeTTSModel: @unchecked Sendable {
             }, onFrame: { frame in
                 if carries { codes.append(frame.map { Int16($0) }) }
             })
-            reports.append(GenerationReport(report))
+            reports.append(BreezeGenerationReport(report))
             if carries, report.stoppedOnEndOfSpeech, let task = try Self.carriedTask(request.task, fragment: fragment, codes: codes, pcm: pcm) {
                 request = try BreezeRequest(text: request.text, task: task)
             }
@@ -170,7 +170,7 @@ public final class BreezeTTSModel: @unchecked Sendable {
     }
 
     /// The fragments `request` is spoken in, in order.
-    public func fragments(for request: BreezeRequest, fragmentLength: Int = SynthesisOptions().fragmentLength) -> [String] {
+    public func fragments(for request: BreezeRequest, fragmentLength: Int = BreezeSynthesisOptions().fragmentLength) -> [String] {
         request.fragments(maxLength: fragmentLength)
     }
 

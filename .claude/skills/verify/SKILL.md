@@ -109,7 +109,7 @@ Proof standards:
 
 ## The library surface
 
-For API that the tool does not reach (`BreezeCheckpoint.find(environment:)`, `stream` cancellation, `GenerationReport` fields, `trimSilence`), run the test suite the README documents:
+For API that the tool does not reach (`BreezeCheckpoint.find(environment:)`, `stream` cancellation, `BreezeGenerationReport` fields, `trimSilence`), run the test suite the README documents:
 
 ```sh
 BREEZE_GOLDENS=.audit/goldens swift test -c release

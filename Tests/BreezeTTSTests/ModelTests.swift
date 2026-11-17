@@ -19,8 +19,8 @@ final class ModelTests: XCTestCase {
 
     static let text = "Thank you for calling. How can I help you today?"
 
-    func greedy() -> SynthesisOptions {
-        var o = SynthesisOptions()
+    func greedy() -> BreezeSynthesisOptions {
+        var o = BreezeSynthesisOptions()
         o.greedy = true
         return o
     }
@@ -70,7 +70,7 @@ final class ModelTests: XCTestCase {
     /// next request long before an uncancelled 120 s generation could have finished.
     func testStreamCancellationStopsGeneration() async throws {
         let m = try model()
-        var o = SynthesisOptions()
+        var o = BreezeSynthesisOptions()
         o.maxFrames = 1500
         let long = try BreezeRequest(text: String(repeating: "The quick brown fox jumps over the lazy dog. ", count: 8))
         var received = 0
@@ -87,7 +87,7 @@ final class ModelTests: XCTestCase {
 
     func testGuidanceThePlainTaskRejectsThrowsBeforeAudio() throws {
         let m = try model()
-        var o = SynthesisOptions()
+        var o = BreezeSynthesisOptions()
         o.guidance = 4
         var chunks = 0
         XCTAssertThrowsError(try m.synthesize(try BreezeRequest(text: Self.text), options: o) { _, _ in chunks += 1 })

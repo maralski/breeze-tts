@@ -50,7 +50,7 @@ final class ParityTests: XCTestCase {
     func testSeededRunRepeats() throws {
         let (parity, goldens) = try harness()
         let prompt = try GoldenCase(directory: goldens.appendingPathComponent("design_en")).referencePrompt()
-        var options = SynthesisOptions()
+        var options = BreezeSynthesisOptions()
         options.uniforms = .seeded(7)
         options.maxFrames = 300
         var runs: [[[Int]]] = []
@@ -72,7 +72,7 @@ final class ParityTests: XCTestCase {
         let (parity, _) = try harness()
         var rng = SplitMix64(seed: 3)
         let ids = [Int32(2)] + (1..<2040).map { _ in Int32(3 + rng.next() % 200_000) }
-        var options = SynthesisOptions()
+        var options = BreezeSynthesisOptions()
         options.greedy = true
         var frames = 0
         let report = try parity.synth.run(BreezePrompt(positive: .init(segments: [.text(ids)]), guidance: nil), options: options) { _ in frames += 1 }

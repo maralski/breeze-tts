@@ -230,8 +230,8 @@ public final class BreezeParity {
     }
     private var teacherDraws: [String: Draws] = [:]
 
-    private func settings(_ golden: GoldenCase, mode: String) -> SynthesisOptions {
-        var o = SynthesisOptions()
+    private func settings(_ golden: GoldenCase, mode: String) -> BreezeSynthesisOptions {
+        var o = BreezeSynthesisOptions()
         o.greedy = mode == "greedy"
         return o
     }

@@ -89,10 +89,10 @@ for try await chunk in model.stream(request) {
 
 `BreezeCheckpoint.find()` returns the checkpoint `BREEZE_WEIGHTS` names, or the newest snapshot in the Hugging Face cache, or nil. Pass its `directory` to the model instead of a fixed path.
 
-`stream(_:options:)` wraps the blocking `synthesize(_:options:onChunk:)`. Call that one directly to get a `GenerationReport` for each fragment, and stop it by throwing from the callback:
+`stream(_:options:)` wraps the blocking `synthesize(_:options:onChunk:)`. Call that one directly to get a `BreezeGenerationReport` for each fragment, and stop it by throwing from the callback:
 
 ```swift
-var options = SynthesisOptions()
+var options = BreezeSynthesisOptions()
 options.seed = 7
 let reports = try model.synthesize(request, options: options) { fragment, chunk in
     try Task.checkCancellation()
@@ -101,11 +101,11 @@ let reports = try model.synthesize(request, options: options) { fragment, chunk 
 let finished = reports.allSatisfy(\.stopped)
 ```
 
-`GenerationReport.stopped` is `false` when a fragment ran to `SynthesisOptions.maxFrames` instead of ending by itself. Retry such a fragment with another seed.
+`BreezeGenerationReport.stopped` is `false` when a fragment ran to `BreezeSynthesisOptions.maxFrames` instead of ending by itself. Retry such a fragment with another seed.
 
 ### Long text keeps one voice
 
-`synthesize` splits text longer than `SynthesisOptions.fragmentLength` (60 words or CJK characters by default) at sentence ends, and generates the fragments one after another. Plain and voice-design requests have no fixed voice, so each fragment would get a new speaker. To keep one voice, fragment 0's own audio codes and text become the reference voice for the later fragments. A design request continues as a voice direction with the same instruction and guidance, and a plain request continues as a clone. Clone and direction requests already carry a voice and run unchanged.
+`synthesize` splits text longer than `BreezeSynthesisOptions.fragmentLength` (60 words or CJK characters by default) at sentence ends, and generates the fragments one after another. Plain and voice-design requests have no fixed voice, so each fragment would get a new speaker. To keep one voice, fragment 0's own audio codes and text become the reference voice for the later fragments. A design request continues as a voice direction with the same instruction and guidance, and a plain request continues as a clone. Clone and direction requests already carry a voice and run unchanged.
 
 The carry holds the voice. We measured it on a 59-word paragraph in three fragments (15 to 21 s of speech) with five seeds, as the cosine similarity of CAM++ speaker embeddings between every two fragments of one paragraph:
 

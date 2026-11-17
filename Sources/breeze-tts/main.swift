@@ -46,7 +46,7 @@ struct Args {
     var instruction: String?
     var clone: String?
     var transcript: String?
-    var options = SynthesisOptions()
+    var options = BreezeSynthesisOptions()
     var repeats = 5
     var frame = FrameBench.Options()
     var codec = CodecBench.Options()
