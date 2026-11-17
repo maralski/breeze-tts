@@ -126,13 +126,13 @@ final class CodecKernels: @unchecked Sendable {
     /// Simdgroups per threadgroup of the tile kernel. Overridable for the bench.
     nonisolated(unsafe) static var simdgroups = 4
 
-    /// The tile for a product of `m` rows: tall blocks only when there are rows to fill them.
-    static func tile(rows m: Int, n: Int) -> Tile {
-        if let t = tileOverride { return t }
-        if m <= 8 { return Tile(tm: 1, tn: 4) }
-        if m <= 16 { return Tile(tm: 2, tn: 4) }
-        return Tile(tm: 4, tn: 4)
-    }
+    /// The tile every product uses unless overridden. Measured on an M3 Max over a whole
+    /// streamed frame (--bench-codec, medians of 5 interleaved rounds, ranges within 0.1 ms):
+    /// 1x2 5.18 ms, 2x2 5.22, 1x4 5.46, 4x2 5.80, 2x4 5.98, 1x8 6.66, 4x4 7.58.
+    static func tile() -> Tile { tileOverride ?? Tile(tm: 1, tn: 2) }
+
+    /// Multiply-adds of the products encoded so far (rows x columns x K): the bench's work count.
+    nonisolated(unsafe) static var multiplyAdds = 0
 
     private func setBytes<T>(_ e: Encoder, _ value: T, index: Int) {
         withUnsafeBytes(of: value) { e.ce.setBytes($0.baseAddress!, length: $0.count, index: index) }
@@ -160,8 +160,9 @@ final class CodecKernels: @unchecked Sendable {
             case .clamp: flags |= 128
             }
         }
+        Self.multiplyAdds += m * conv.n * conv.k
         let tiled = conv.cin % 8 == 0 && conv.n >= 8
-        let tile = Self.tile(rows: m, n: conv.n)
+        let tile = Self.tile()
         let blocks = (conv.n + 8 * tile.tn - 1) / (8 * tile.tn)
         let sg = min(Self.simdgroups, blocks)
         e.start(tiled ? gemm[tile]! : direct, weightBytes: conv.n * conv.k * 4)

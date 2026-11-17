@@ -72,6 +72,8 @@ final class CodecDecoder {
         func floats() -> [Float] { buffer.floats(count: rows * width, offset: offset) }
     }
     private(set) var lastStages: [String: StageView] = [:]
+    /// Which dispatches of the last appended step belong to which part of the decoder, in order.
+    private(set) var lastParts: [(name: String, dispatches: Range<Int>)] = []
 
     convenience init(directory: URL, ctx: MetalContext, chunkFrames: Int = 1, maxFrames: Int = 2048, pcmSlots: Int = 8) throws {
         try self.init(ctx: ctx, kernels: try CodecKernels(ctx: ctx), weights: try CodecDecoderWeights(try CodecLoader(directory: directory, ctx: ctx)),
@@ -158,8 +160,11 @@ final class CodecDecoder {
         let h = CodecDecoderWeights.hidden, lat = CodecDecoderWeights.latent, heads = CodecDecoderWeights.heads
         var list: [(Encoder) -> Void] = []
         var stages: [String: StageView] = [:]
+        var parts: [(name: String, dispatches: Range<Int>)] = []
+        func close(_ name: String) { parts.append((name, (parts.last?.dispatches.upperBound ?? 0)..<list.count)) }
         if n0 == 0 {
             for ring in rings { list.append { k.zero($0, ring.buffer, bytes: ring.storedBytes) } }
+            close("reset")
         }
 
         let sumsView = ActView(sums, ld: 2 * CodecShape.codebookDim), quantizedView = ActView(quantized, ld: h)
@@ -170,6 +175,7 @@ final class CodecDecoder {
         let preView = ActView(preOut, ld: lat)
         list.append { k.product($0, preRing.window(head: n0), rows: f, w.preConv, main: preView) }
         stages["pre_conv"] = StageView(buffer: preOut, offset: 0, rows: f, width: lat)
+        close("quantizer+pre_conv")
 
         let xView = ActView(x, ld: h), xnView = ActView(xn, ld: h), qkvView = ActView(qkv, ld: 3 * lat)
         let attnView = ActView(attn, ld: lat), gateUpView = ActView(gateUp, ld: 2 * lat), mlpView = ActView(mlp, ld: lat)
@@ -191,6 +197,7 @@ final class CodecDecoder {
         list.append { k.norm($0, xView, rows: f, width: h, weight: w.finalNorm, xnView, eps: eps) }
         list.append { k.product($0, CodecWindow(xnView), rows: f, w.outputProj, main: latentView) }
         stages["pre_transformer"] = StageView(buffer: latent, offset: 0, rows: f, width: lat)
+        close("transformer")
 
         let conv0Ring = self.conv0Ring
         var input = latentView
@@ -210,12 +217,14 @@ final class CodecDecoder {
             stages["upsample\(i)"] = StageView(buffer: us.out, offset: 0, rows: rows, width: lat)
             input = outView
         }
+        close("upsample")
 
         let conv0View = ActView(conv0Out, ld: CodecDecoderWeights.vocoderWidth), firstBlock = blocks[0], finalRing = self.finalRing
         list.append {
             k.product($0, conv0Ring.window(head: 4 * n0), rows: 4 * f, w.conv0, main: conv0View, act: firstBlock.transRing.output(head: 4 * n0, w.blocks[0].inAct))
         }
         stages["decoder0"] = StageView(buffer: conv0Out, offset: 0, rows: 4 * f, width: CodecDecoderWeights.vocoderWidth)
+        close("vocoder conv 1024>1536")
         for (i, (bw, bs)) in zip(w.blocks, blocks).enumerated() {
             let c = bw.channels, headIn = n0 * bs.rowsIn, head = n0 * bs.rowsOut, rows = bs.rowsOut * f
             let stream = ActView(bs.stream, ld: c)
@@ -238,6 +247,7 @@ final class CodecDecoder {
                 list.append { k.product($0, CodecWindow(bs.branch, ld: c), rows: rows, unit.conv2, main: stream, accumulate: true, act: next) }
             }
             stages["decoder\(i + 1)"] = StageView(buffer: bs.stream, offset: 0, rows: rows, width: c)
+            close("vocoder block x\(bw.stride) to \(c)")
         }
         let samples = f * CodecShape.samplesPerFrame
         let finalHead = n0 * CodecShape.samplesPerFrame
@@ -247,9 +257,11 @@ final class CodecDecoder {
         list.append {
             k.product($0, finalRing.window(head: finalHead), rows: samples, w.finalConv, act: CodecActOutput(buffer: pcm, offset: pcmOffset, ld: 1, channels: 1, activation: .clamp))
         }
+        close("final conv")
         frames += f
         steps += 1
         lastStages = stages
+        lastParts = parts
         return (list, pcmOffset, samples)
     }
 
