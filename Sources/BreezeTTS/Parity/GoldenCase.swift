@@ -23,7 +23,7 @@ struct GoldenCase {
     }
 
     var name: String { manifest["case"] as? String ?? directory.lastPathComponent }
-    var text: String { manifest["text"] as! String }
+    var text: String? { manifest["text"] as? String }
     var instruction: String? { manifest["instruction"] as? String }
     var guidance: Float { Float(manifest["cfg_scale"] as! Double) }
     var frameCap: Int { manifest["frame_cap"] as? Int ?? 120 }
@@ -122,6 +122,6 @@ struct GoldenCase {
         case (let v?, nil): task = .voiceClone(v)
         case (let v?, let i?): task = .voiceDirection(v, instruction: i)
         }
-        return try BreezeRequest(text: text, task: task)
+        return try BreezeRequest(text: text ?? "", task: task)
     }
 }

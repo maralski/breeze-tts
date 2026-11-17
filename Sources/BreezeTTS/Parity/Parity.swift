@@ -140,10 +140,12 @@ public final class BreezeParity {
 
         // Front end: the prompt the port builds from the case's request against the reference's.
         let prompt = try golden.referencePrompt()
-        let built = try BreezePrompt(fragment: golden.text, of: try golden.request(), guidance: golden.guidance, tokenizer: tokenizer)
-        let builtOK = built == prompt
-        report.streams.append(StreamLine(name: "front_end_prompt", frames: built.positive.count, referenceFrames: prompt.positive.count,
-                                         mismatches: builtOK ? 0 : 1, first: builtOK ? nil : (0, 0, "built prompt differs from the manifest's input_ids and segments"), passed: builtOK))
+        if let text = golden.text {
+            let built = try BreezePrompt(fragment: text, of: try golden.request(), guidance: golden.guidance, tokenizer: tokenizer)
+            let builtOK = built == prompt
+            report.streams.append(StreamLine(name: "front_end_prompt", frames: built.positive.count, referenceFrames: prompt.positive.count,
+                                             mismatches: builtOK ? 0 : 1, first: builtOK ? nil : (0, 0, "built prompt differs from the manifest's input_ids and segments"), passed: builtOK))
+        }
 
         let layout = PromptLayout(prompt)
         let (loop, prefill) = try synth.loop(sequences: layout.branches.count)
@@ -178,6 +180,8 @@ public final class BreezeParity {
             let b = golden.branches.firstIndex(of: seg.branch)!
             try add(prefix + "proj", synth.inputs[b].floats(count: L * w, offset: seg.text.row * w * 4), try golden.require(prefix + "proj"), width: w)
         }
+        // A text-encoder-only case (long_text) stops here.
+        guard try golden.tensor("prefill_cond_inputs_embeds") != nil else { return report }
         for (b, branch) in layout.branches.enumerated() {
             let name = "prefill_\(golden.branches[b])_inputs_embeds"
             try add(name, synth.inputs[b].floats(count: branch.rows * w), try golden.require(name), width: w)

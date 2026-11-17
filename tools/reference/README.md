@@ -16,7 +16,10 @@ export BREEZE_REF_SRC=/path/to/breeze-tts-reference-clone
 .venv/bin/python tools/reference/make_goldens.py --precision bf16                  # about 7 min, replays the fp32 codes
 .venv/bin/python tools/reference/check_goldens.py
 .venv/bin/python tools/reference/verify_checkpoint.py                              # spec claims vs checkpoint and loaded modules
+.venv/bin/python tools/reference/make_long_text_golden.py                           # long_text: one 337-token encoder segment, about 1 min
 ```
+
+`long_text` holds only the fp32 text-encoder tensors of one segment longer than 256 tokens. The five main cases never engage the encoder's sliding window; this one does.
 
 `BREEZE_GOLDENS` overrides the output directory. The fp32 pass must run first. It writes the reference clip that the clone cases read, and the bf16 pass replays its codes.
 
