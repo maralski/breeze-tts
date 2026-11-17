@@ -93,10 +93,10 @@ public final class BreezeTTSModel: @unchecked Sendable {
         synth = try Synthesizer(directory: directory)
         decoder = try CodecDecoder(directory: directory, ctx: synth.ctx)
         tokenizer = try BreezeTokenizer(tokenizerJSON: directory.appendingPathComponent("tokenizer.json"))
-        // Compiled pipelines and both frame loops (plain and guided) up front, so the first
-        // request does not pay for them.
+        // Every pipeline compiled up front. The frame loops stay lazy: building both at load saved
+        // the first request about 25 ms but holds their backbone KV caches (470 MB per sequence,
+        // 1.4 GB for the plain and the guided loop) whether or not a request needs them.
         try synth.ctx.warmUpPipelines()
-        for sequences in 1...2 { _ = try synth.loop(sequences: sequences) }
     }
 
     // MARK: synthesis
@@ -146,7 +146,7 @@ public final class BreezeTTSModel: @unchecked Sendable {
                 if carries { codes.append(frame.map { Int16($0) }) }
             })
             reports.append(GenerationReport(report))
-            if carries, let task = try Self.carriedTask(request.task, fragment: fragment, codes: codes, pcm: pcm) {
+            if carries, report.stoppedOnEndOfSpeech, let task = try Self.carriedTask(request.task, fragment: fragment, codes: codes, pcm: pcm) {
                 request = try BreezeRequest(text: request.text, task: task)
             }
         }
@@ -155,7 +155,8 @@ public final class BreezeTTSModel: @unchecked Sendable {
 
     /// The task later fragments run as, with fragment 0's frames up to its trailing silence as
     /// the reference voice. Nil leaves the task as it is: fragment 0 produced no speech, or so
-    /// much that the clip would crowd the backbone's positions.
+    /// much that the clip would crowd the backbone's positions. A fragment cut off by
+    /// `maxFrames` is not carried (`synthesize` checks), since its codes would not match its text.
     static func carriedTask(_ task: BreezeTask, fragment: String, codes: [[Int16]], pcm: [Float]) throws -> BreezeTask? {
         let spoken = trimTrailingSilence(pcm, sampleRate: sampleRate).count
         let frames = min(codes.count, (spoken + CodecShape.samplesPerFrame - 1) / CodecShape.samplesPerFrame)
@@ -188,6 +189,8 @@ public final class BreezeTTSModel: @unchecked Sendable {
     /// `BreezeReferenceVoice.recommendedMaxSeconds`.
     public func encodeReference(samples: [Float], sampleRate: Int, transcript: String) throws -> BreezeReferenceVoice {
         guard !samples.isEmpty else { throw BreezeTTSError.badInput("reference audio is empty") }
+        lock.lock()
+        defer { lock.unlock() }
         let codes = try codecEncoder().encode(samples: samples, sampleRate: sampleRate)
         return try BreezeReferenceVoice(transcript: transcript, codes: codes)
     }
