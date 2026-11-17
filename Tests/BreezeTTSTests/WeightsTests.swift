@@ -139,5 +139,5 @@ final class WeightsTests: GPUTestCase {
 
 enum TestEnvironment {
     /// BREEZE_WEIGHTS, else the newest complete Breeze-TTS-2 snapshot in the Hugging Face cache.
-    static let weightsDirectory: URL? = BreezeCheckpoint.find()?.directory
+    static let weightsDirectory: URL? = BreezeCheckpoint.find().flatMap { $0.isComplete ? $0.directory : nil }
 }

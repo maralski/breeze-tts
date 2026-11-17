@@ -101,7 +101,7 @@ final class ModelTests: XCTestCase {
             throw XCTSkip("set BREEZE_GOLDENS to compare against the reference PCM")
         }
         let m = try model()
-        for name in ["plain_en", "design_en", "design_zh"] {
+        for name in ["plain_en", "design_en", "design_zh", "clone_en", "direction_en"] {
             let golden = try GoldenCase(directory: goldens.appendingPathComponent(name))
             var pcm: [Float] = []
             let reports = try m.synthesize(try golden.request(), options: greedy()) { pcm += $1 }

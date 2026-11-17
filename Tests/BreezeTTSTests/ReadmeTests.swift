@@ -9,9 +9,8 @@ import XCTest
 final class ReadmeTests: XCTestCase {
     func testLibraryExamplesRun() async throws {
         guard let checkpoint = BreezeCheckpoint.find(), checkpoint.isComplete else { throw XCTSkip("no complete Breeze-TTS-2 checkpoint") }
-        let clipURL = try XCTUnwrap(ProcessInfo.processInfo.environment["BREEZE_GOLDENS"].map {
-            URL(fileURLWithPath: $0).appendingPathComponent("ref_clip_en.wav")
-        }, "set BREEZE_GOLDENS for the reference clip")
+        guard let goldens = ProcessInfo.processInfo.environment["BREEZE_GOLDENS"] else { throw XCTSkip("set BREEZE_GOLDENS for the reference clip") }
+        let clipURL = URL(fileURLWithPath: goldens).appendingPathComponent("ref_clip_en.wav")
 
         let model = try BreezeTTSModel(directory: checkpoint.directory)
         let request = try BreezeRequest(
