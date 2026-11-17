@@ -9,7 +9,8 @@ reference clip is a whole number of frames. This writes, under <goldens>/codec_e
              (same tensors as <case>/codec/, without the stream runs)
   enc_odd/   the first 50001 samples of ref_clip_en.wav through the encoder: a partial last
              frame and an odd 25 Hz length, so the right pads run
-  enc_long/  the first 200001 samples of long/pcm_full, as PCM16, through the encoder
+  enc_long/  the first 287001 samples of long/pcm_full (12 s, 299 frames at 25 Hz, past the 250 the
+             config names as an attention window), as PCM16, through the encoder
 
 Environment: the repo venv, CPU only. BREEZE_WEIGHTS is the checkpoint dir; BREEZE_GOLDENS
 overrides <repo>/.audit/goldens. Run make_goldens.py first.
@@ -98,7 +99,7 @@ def main() -> None:
     clip, sr = sf.read(GOLDENS / "ref_clip_en.wav", dtype="float32")
     assert sr == 24000
     encoder_stages(atok, clip[:50001], OUT / "enc_odd")
-    pcm16 = np.round(np.clip(stages["pcm_full"].numpy()[:200001], -1, 1) * 32767).astype(np.int16)
+    pcm16 = np.round(np.clip(stages["pcm_full"].numpy()[:287001], -1, 1) * 32767).astype(np.int16)
     encoder_stages(atok, pcm16.astype(np.float32) / 32768, OUT / "enc_long")
 
 

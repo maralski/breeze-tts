@@ -131,8 +131,10 @@ final class CodecKernels: @unchecked Sendable {
     /// 1x2 5.18 ms, 2x2 5.22, 1x4 5.46, 4x2 5.80, 2x4 5.98, 1x8 6.66, 4x4 7.58.
     static func tile() -> Tile { tileOverride ?? Tile(tm: 1, tn: 2) }
 
-    /// Multiply-adds of the products encoded so far (rows x columns x K): the bench's work count.
+    /// Multiply-adds of the products encoded while `countsWork` is set (rows x columns x K).
+    /// The bench's work count; off otherwise, so encoding threads share no counter.
     nonisolated(unsafe) static var multiplyAdds = 0
+    nonisolated(unsafe) static var countsWork = false
 
     private func setBytes<T>(_ e: Encoder, _ value: T, index: Int) {
         withUnsafeBytes(of: value) { e.ce.setBytes($0.baseAddress!, length: $0.count, index: index) }
@@ -160,7 +162,7 @@ final class CodecKernels: @unchecked Sendable {
             case .clamp: flags |= 128
             }
         }
-        Self.multiplyAdds += m * conv.n * conv.k
+        if Self.countsWork { Self.multiplyAdds += m * conv.n * conv.k }
         let tiled = conv.cin % 8 == 0 && conv.n >= 8
         let tile = Self.tile()
         let blocks = (conv.n + 8 * tile.tn - 1) / (8 * tile.tn)

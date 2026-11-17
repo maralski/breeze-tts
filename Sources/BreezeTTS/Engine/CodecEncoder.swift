@@ -205,24 +205,7 @@ final class CodecEncoder {
         list.append { k.product($0, lastInput!.window, rows: frames25, w.last, main: xView) }
         try run { e in list.forEach { $0(e) } }
         stages.seanet = x.floats(count: frames25 * h)
-
-        let xn = try plain(frames25, h, "xn"), qkv = try plain(frames25, 3 * h, "qkv"), attn = try plain(frames25, h, "attn"), wide = try plain(frames25, 4 * h, "wide")
-        let heads = CodecEncoderWeights.heads, eps = CodecEncoderWeights.layerNormEps
-        let keys = try ctx.makeBuffer(bytes: heads * frames25 * 64 * 4, label: "encoder.k"), values = try ctx.makeBuffer(bytes: heads * frames25 * 64 * 4, label: "encoder.v")
-        let rope = try RopeTable(ctx: ctx, positions: frames25)
-        let xnView = ActView(xn, ld: h), qkvView = ActView(qkv, ld: 3 * h), attnView = ActView(attn, ld: h)
-        try run { e in
-            for layer in w.layers {
-                k.norm(e, xView, rows: frames25, width: h, weight: layer.norm1Weight, bias: layer.norm1Bias, xnView, eps: eps)
-                k.product(e, CodecWindow(xnView), rows: frames25, layer.qkv, main: qkvView)
-                k.ropeKV(e, qkvView, rows: frames25, heads: heads, pos0: 0, ring: frames25, k: keys, v: values, table: rope)
-                k.attention(e, qkvView, rows: frames25, heads: heads, pos0: 0, window: frames25, ring: frames25, k: keys, v: values, attnView)
-                k.product(e, CodecWindow(attnView), rows: frames25, layer.o, main: xView, accumulate: true)
-                k.norm(e, xView, rows: frames25, width: h, weight: layer.norm2Weight, bias: layer.norm2Bias, xnView, eps: eps)
-                k.product(e, CodecWindow(xnView), rows: frames25, layer.fc1, act: CodecActOutput(buffer: wide, ld: 4 * h, channels: 4 * h, activation: .gelu))
-                k.product(e, CodecWindow(wide, ld: 4 * h), rows: frames25, layer.fc2, main: xView, accumulate: true)
-            }
-        }
+        try transform(x, rows: frames25)
         stages.transformer = x.floats(count: frames25 * h)
 
         // The downsampling conv pads by repeating the edge rows, unlike every other conv here.
@@ -241,6 +224,40 @@ final class CodecEncoder {
         stages.downsample = down.floats(count: frames * h)
         stages.codes = Self.read(codes, rows: frames)
         return stages
+    }
+
+    /// The transformer over `frames25` rows of `x` ([rows][512]), in place. Every position
+    /// attends to all earlier ones: the reference runs full causal attention here, checked on a
+    /// 299-frame clip, longer than the 250-frame window its config names.
+    private func transform(_ x: MTLBuffer, rows frames25: Int) throws {
+        let k = kernels, w = weights, h = CodecEncoderWeights.hidden
+        let xView = ActView(x, ld: h)
+        let xn = try plain(frames25, h, "xn"), qkv = try plain(frames25, 3 * h, "qkv"), attn = try plain(frames25, h, "attn"), wide = try plain(frames25, 4 * h, "wide")
+        let heads = CodecEncoderWeights.heads, eps = CodecEncoderWeights.layerNormEps
+        let keys = try ctx.makeBuffer(bytes: heads * frames25 * 64 * 4, label: "encoder.k"), values = try ctx.makeBuffer(bytes: heads * frames25 * 64 * 4, label: "encoder.v")
+        let rope = try RopeTable(ctx: ctx, positions: frames25)
+        let xnView = ActView(xn, ld: h), qkvView = ActView(qkv, ld: 3 * h), attnView = ActView(attn, ld: h)
+        try run { e in
+            for layer in w.layers {
+                k.norm(e, xView, rows: frames25, width: h, weight: layer.norm1Weight, bias: layer.norm1Bias, xnView, eps: eps)
+                k.product(e, CodecWindow(xnView), rows: frames25, layer.qkv, main: qkvView)
+                k.ropeKV(e, qkvView, rows: frames25, heads: heads, pos0: 0, ring: frames25, k: keys, v: values, table: rope)
+                k.attention(e, qkvView, rows: frames25, heads: heads, pos0: 0, window: frames25, ring: frames25, k: keys, v: values, attnView)
+                k.product(e, CodecWindow(attnView), rows: frames25, layer.o, main: xView, accumulate: true)
+                k.norm(e, xView, rows: frames25, width: h, weight: layer.norm2Weight, bias: layer.norm2Bias, xnView, eps: eps)
+                k.product(e, CodecWindow(xnView), rows: frames25, layer.fc1, act: CodecActOutput(buffer: wide, ld: 4 * h, channels: 4 * h, activation: .gelu))
+                k.product(e, CodecWindow(wide, ld: 4 * h), rows: frames25, layer.fc2, main: xView, accumulate: true)
+            }
+        }
+    }
+
+    /// The transformer alone over a given conv-stack output [rows][512].
+    func transform(seanet: [Float]) throws -> [Float] {
+        let h = CodecEncoderWeights.hidden, rows = seanet.count / h
+        let x = try plain(rows, h, "x")
+        x.write(seanet)
+        try transform(x, rows: rows)
+        return x.floats(count: rows * h)
     }
 
     /// Residual vector quantization of rows of the 12.5 Hz embedding: project into the semantic

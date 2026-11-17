@@ -15,6 +15,15 @@ enum CodecGoldens {
         return (root, weights)
     }
 
+    /// A case directory, or a skip naming the script that writes it.
+    static func directory(_ goldens: URL, _ name: String) throws -> URL {
+        let dir = goldens.appendingPathComponent(name)
+        guard FileManager.default.fileExists(atPath: dir.path) else {
+            throw XCTSkip("\(name) is missing from the goldens; run tools/reference/\(name.hasPrefix("codec_extra") ? "make_codec_extras.py" : "make_goldens.py")")
+        }
+        return dir
+    }
+
     static func floats(_ url: URL) throws -> [Float] {
         let data = try Data(contentsOf: url)
         return data.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
@@ -82,8 +91,8 @@ final class CodecDecoderParityTests: XCTestCase {
         return (s.ctx, s.kernels, s.codec, s.weights, env.goldens)
     }
 
-    func directory(_ goldens: URL, _ name: String) -> URL {
-        name.contains("/") ? goldens.appendingPathComponent(name) : goldens.appendingPathComponent(name).appendingPathComponent("codec")
+    func directory(_ goldens: URL, _ name: String) throws -> URL {
+        try CodecGoldens.directory(goldens, name.contains("/") ? name : name + "/codec")
     }
 
     /// One frame per command buffer, every stage of every frame against one full forward of the
@@ -93,7 +102,7 @@ final class CodecDecoderParityTests: XCTestCase {
         let decoder = try CodecDecoder(ctx: env.ctx, kernels: env.codec, weights: env.weights)
         let codeBuffer = try env.ctx.makeBuffer(bytes: 64, label: "codes")
         for name in Self.cases {
-            let dir = directory(env.goldens, name)
+            let dir = try directory(env.goldens, name)
             let codes = try CodecGoldens.codes(dir.appendingPathComponent("codes.i32"))
             var got: [String: [Float]] = [:]
             var pcm: [Float] = []
@@ -133,7 +142,7 @@ final class CodecDecoderParityTests: XCTestCase {
     func testBatchDecodeEqualsOneFrameStream() throws {
         let env = try environment()
         for name in ["design_zh", "codec_extra/long"] {
-            let dir = directory(env.goldens, name)
+            let dir = try directory(env.goldens, name)
             let codes = try CodecGoldens.codes(dir.appendingPathComponent("codes.i32"))
             let want = try CodecGoldens.floats(dir.appendingPathComponent("pcm_full.f32"))
             let single = try CodecDecoder(ctx: env.ctx, kernels: env.codec, weights: env.weights).decode(codes: codes)
@@ -151,7 +160,7 @@ final class CodecDecoderParityTests: XCTestCase {
     /// buffer as the token loop lays them out, and a second stream after a reset.
     func testPipelinedFramesAndReset() throws {
         let env = try environment()
-        let dir = directory(env.goldens, "plain_en")
+        let dir = try directory(env.goldens, "plain_en")
         let codes = try CodecGoldens.codes(dir.appendingPathComponent("codes.i32"))
         let want = try CodecGoldens.floats(dir.appendingPathComponent("pcm_full.f32"))
         let decoder = try CodecDecoder(ctx: env.ctx, kernels: env.codec, weights: env.weights, pcmSlots: 4)
@@ -185,13 +194,14 @@ final class CodecDecoderParityTests: XCTestCase {
 
 final class CodecEncoderParityTests: XCTestCase {
     /// The reference clip (a whole number of frames), a clip cut mid-frame with an odd 25 Hz
-    /// length, and an 8.3 s clip: every stage against the reference, codes exactly.
+    /// length, and a 12 s clip whose 299 frames at 25 Hz exceed the 250-frame window the config
+    /// names: every stage against the reference, codes exactly.
     func testEncoderMatchesReferenceCodes() throws {
         let env = try CodecGoldens.require()
         let ctx = GPUTestCase.ctx
         let encoder = try CodecEncoder(ctx: ctx, kernels: try CodecKernels(ctx: ctx), weights: try CodecEncoderWeights(try CodecLoader(directory: env.weights, ctx: ctx)), engine: GPUTestCase.kernels)
         for name in ["clone_en/encoder", "direction_en/encoder", "codec_extra/enc_odd", "codec_extra/enc_long"] {
-            let dir = env.goldens.appendingPathComponent(name)
+            let dir = try CodecGoldens.directory(env.goldens, name)
             let samples = try CodecGoldens.floats(dir.appendingPathComponent("input_samples.f32"))
             let want = try CodecGoldens.codes(dir.appendingPathComponent("codes.i32"))
             let t0 = Date()
@@ -207,6 +217,13 @@ final class CodecEncoderParityTests: XCTestCase {
                 XCTAssertGreaterThanOrEqual(a.cosine, 0.9999, "\(name) \(stage)")
                 XCTAssertLessThanOrEqual(a.maxAbs, 2e-4 * a.peak, "\(name) \(stage)")
             }
+            let goldenSeanet = CodecGoldens.timeMajor(try CodecGoldens.floats(dir.appendingPathComponent("seanet.f32")), channels: 512)
+            let goldenTransformer = try CodecGoldens.floats(dir.appendingPathComponent("transformer.f32"))
+            let alone = try encoder.transform(seanet: goldenSeanet)
+            let b = CodecGoldens.compare(alone, goldenTransformer)
+            let worst = alone.indices.max { abs(alone[$0] - goldenTransformer[$0]) < abs(alone[$1] - goldenTransformer[$1]) }!
+            print(String(format: "encoder parity %@ transformer from the reference conv output: maxAbs %.3g at frame %d channel %d (reference value %.3g)",
+                         name, b.maxAbs, worst / 512, worst % 512, goldenTransformer[worst]))
             let fromGolden = try encoder.quantize(embedding: goldenDown)
             let flatWant = want.flatMap { $0 }
             let endToEnd = zip(got.codes.flatMap { $0 }, flatWant).filter { Int($0) != $1 }.count

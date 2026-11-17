@@ -109,6 +109,7 @@ public enum CodecBench {
         decoder.reset()
         _ = decoder.append(codes: codes, codesOffset: 0)
         CodecKernels.multiplyAdds = 0
+        CodecKernels.countsWork = true
         let tally = DispatchTally()
         var partWork: [(name: String, dispatches: Int, multiplyAdds: Int)] = []
         do {
@@ -123,6 +124,7 @@ public enum CodecBench {
             e.ce.endEncoding()
         }
         let frameMultiplyAdds = CodecKernels.multiplyAdds
+        CodecKernels.countsWork = false
 
         var samples = [Samples](repeating: Samples(), count: variants.count)
         for round in 0..<(o.rounds + 1) {

@@ -266,9 +266,9 @@ final class CodecDecoder {
     }
 
     /// Decodes a whole stream from the start, `chunkFrames` frames per command buffer.
-    func decode(codes: [[Int]]) throws -> [Float] {
+    func decode<Code: BinaryInteger>(codes: [[Code]]) throws -> [Float] {
         let books = CodecShape.codebooks
-        guard codes.allSatisfy({ $0.count == books && $0.allSatisfy { (0..<CodecShape.codebookSize).contains($0) } }) else {
+        guard codes.allSatisfy({ $0.count == books && $0.allSatisfy { $0 >= 0 && $0 < CodecShape.codebookSize } }) else {
             throw BreezeTTSError.badInput("codec frames are \(books) codes in 0..<\(CodecShape.codebookSize)")
         }
         guard codes.count <= maxFrames else { throw BreezeTTSError.badInput("\(codes.count) frames exceed the decoder's \(maxFrames)") }
