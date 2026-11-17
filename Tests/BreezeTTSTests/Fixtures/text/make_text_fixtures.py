@@ -118,8 +118,11 @@ for s in corpus:
     tokenizer_cases.append({"text": s, "ids": ids})
 
 # Per-segment versus joint: the reference renders each text segment as decode(encode(text)) and
-# re-encodes the joined prompt; a port encodes each segment once. Every corpus string is tried as
-# text, transcript and instruction, on both sides of an audio segment.
+# re-encodes the joined prompt; a port encodes each segment once. The decoder turns every U+2581 into
+# a space, so a port must too: a literal "▁▁" is an added token, but its decoded "  " is not. Every
+# corpus string is tried as text, transcript and instruction, on both sides of an audio segment.
+for s in corpus:
+    assert tok.decode(tok(s)["input_ids"], skip_special_tokens=False) == "<bos>" + s.replace("\u2581", " "), repr(s)
 def joint(segments):
     codes_by_path = {}
     def encode_audio(_, path):
@@ -136,7 +139,7 @@ def separate(segments):
     ids, lens = [], []
     for seg in segments:
         if seg["type"] == "text":
-            seg_ids = tok(seg["text"], add_special_tokens=True)["input_ids"]
+            seg_ids = tok(seg["text"].replace("\u2581", " "), add_special_tokens=True)["input_ids"]
             ids += seg_ids
             lens.append(len(seg_ids))
         else:
@@ -188,17 +191,11 @@ def prompt_case(task, text, instruction=None, transcript=None, frames=None, guid
     except ValueError as e:
         case["error"] = str(e)
         return case
-    def branch(prefix):
-        return {"ids": inputs[prefix + "ids"][0].tolist(), "text_mask": inputs[prefix + "text_ids_mask"][0].tolist(),
-                "text_lengths": inputs[prefix + "text_ids_len"].tolist()}
-    case["positive"] = branch("")
-    case["positive"]["ids"] = inputs["input_ids"][0].tolist()
-    case["positive"]["text_mask"] = inputs["text_ids_mask"][0].tolist()
-    case["positive"]["text_lengths"] = inputs["text_ids_len"].tolist()
+    def branch(ids, mask, lengths):
+        return {"ids": inputs[ids][0].tolist(), "text_mask": inputs[mask][0].tolist(), "text_lengths": inputs[lengths].tolist()}
+    case["positive"] = branch("input_ids", "text_ids_mask", "text_ids_len")
     if "cfg_negative_prompt_ids" in inputs:
-        case["negative"] = {"ids": inputs["cfg_negative_prompt_ids"][0].tolist(),
-                            "text_mask": inputs["cfg_negative_text_ids_mask"][0].tolist(),
-                            "text_lengths": inputs["cfg_negative_text_ids_len"].tolist()}
+        case["negative"] = branch("cfg_negative_prompt_ids", "cfg_negative_text_ids_mask", "cfg_negative_text_ids_len")
     return case
 
 prompt_cases = []

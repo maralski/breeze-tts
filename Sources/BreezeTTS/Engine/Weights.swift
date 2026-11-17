@@ -262,6 +262,15 @@ struct FrameWeights {
     /// bf16 [16 * 2051, 2048]: row `code + q * 2051` embeds code `code` of codebook `q`.
     let embedding: GPUTensor
 
+    init(backbone: DecoderWeights, lmHead: Linear, depth: DecoderWeights, depthProjector: Linear, codebookHeads: [Linear], embedding: GPUTensor) {
+        self.backbone = backbone
+        self.lmHead = lmHead
+        self.depth = depth
+        self.depthProjector = depthProjector
+        self.codebookHeads = codebookHeads
+        self.embedding = embedding
+    }
+
     init(_ store: any TensorStore, ctx: MetalContext) throws {
         backbone = try WeightArena.load(store, ctx: ctx, label: "weights.backbone") {
             try DecoderWeights($0, prefix: "backbone_model", config: .backbone)
