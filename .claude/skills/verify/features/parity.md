@@ -20,7 +20,7 @@ Preconditions:
 - `$V/doctor.sh` exits 0 and prints an `ok    goldens <dir>` line. The goldens are not published. With no goldens, report this feature as not run.
 - `G` is the goldens directory from that line.
 
-- **One case.** Run `$V/drive.sh parity-plain -- --parity "$G/plain_en"`. Exit 0. The last line of stdout is `summary plain_en: N tensors, worst cosine 0.99999..., N streams, 0 failed`.
+- **One case.** Run `$V/drive.sh parity-plain -- --parity "$G/plain_en"`. Exit 0. The last line of stdout is `summary plain_en: 22 tensors, worst cosine 1.000000, 5 streams, 0 failed` (any worst cosine of 0.9999 or more passes).
 - **Every case.** Run `for c in plain_en design_en design_zh clone_en direction_en long_text; do $V/drive.sh parity-$c -- --parity "$G/$c" | grep summary; done`. Every summary line ends `0 failed`, and every `exit.txt` holds 0.
 - **Greedy PCM.** Run `$V/drive.sh pcm-plain -- --say "Thank you for calling. How can I help you today?" --greedy`. Stdout has `fragment 1: 49 frames, stopped true`. Then compare: `python3 -c "import numpy as n,sys; d=open(sys.argv[1],'rb').read(); g=n.frombuffer(d[44:],'<f4'); w=n.fromfile(sys.argv[2],'<f4'); print(len(g), len(w), abs(g-w).max())" <evidence dir>/out.wav "$G/plain_en/codec/pcm_full.f32"`. It prints `94080 94080` and a maximum difference near 2e-6. The design cases take their text and `--instruction` from `manifest.json` and match the same way, within 1e-5.
 
