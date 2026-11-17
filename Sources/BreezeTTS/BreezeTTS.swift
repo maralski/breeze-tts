@@ -93,7 +93,10 @@ public final class BreezeTTSModel: @unchecked Sendable {
         synth = try Synthesizer(directory: directory)
         decoder = try CodecDecoder(directory: directory, ctx: synth.ctx)
         tokenizer = try BreezeTokenizer(tokenizerJSON: directory.appendingPathComponent("tokenizer.json"))
+        // Compiled pipelines and both frame loops (plain and guided) up front, so the first
+        // request does not pay for them.
         try synth.ctx.warmUpPipelines()
+        for sequences in 1...2 { _ = try synth.loop(sequences: sequences) }
     }
 
     // MARK: synthesis
