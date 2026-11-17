@@ -191,6 +191,9 @@ final class Encoder {
         ce.setComputePipelineState(pipeline)
     }
 
+    /// `begin` for kernels encoded from other files (the codec's).
+    func start(_ pipeline: MTLComputePipelineState, weightBytes: Int = 0) { begin(pipeline, weightBytes: weightBytes) }
+
     private func setBytes<T>(_ value: T, index: Int) {
         withUnsafeBytes(of: value) { ce.setBytes($0.baseAddress!, length: $0.count, index: index) }
     }

@@ -3,7 +3,7 @@
 // Metal shader source, compiled at load time so the kernels work inside an .app bundle
 // without a resource bundle. Weights are bf16, activations and accumulation fp32.
 enum ShaderSource {
-    static let all = common + gemv + gemm + norm + attention + sampling
+    static let all = common + gemv + gemm + norm + attention + sampling + codec
 }
 
 // The projection kernels, adapted from MingTTS.
