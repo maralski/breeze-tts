@@ -123,6 +123,17 @@ final class SamplingTests: GPUTestCase {
             XCTAssertEqual(try gpu(.backbone, row, u, settings: s).0, backbone, "u \(u)")
             XCTAssertEqual(try gpu(.depth, row, u, settings: s).0, depth, "u \(u)")
         }
+        // -0 and +0 tie: of ids 1 and 20 at -0 and 3, 5, 9 at +0, the depth sampler keeps the three lowest ids.
+        var zeros = [Float](repeating: -4, count: 2052)
+        for i in [3, 5, 9] { zeros[i] = 0 }
+        zeros[1] = -0.0
+        zeros[20] = -0.0
+        s.topK = 3
+        XCTAssertEqual(SamplingRule.draw(.depth, cond: Array(zeros[..<2051]), settings: s, uniform: 0.9).token, 5)
+        XCTAssertEqual(try gpu(.depth, zeros, 0.9, settings: s).0, 5)
+        XCTAssertEqual(try gpu(.depth, zeros, 0.1, settings: s).0, 1)
+        XCTAssertEqual(try gpu(.backbone, zeros, 0.99, settings: s).0, 20)
+        s.topK = 2
         // The penalty moves a seen maximum below the others; reserved ids never win.
         s.greedy = true
         row[2049] = 50

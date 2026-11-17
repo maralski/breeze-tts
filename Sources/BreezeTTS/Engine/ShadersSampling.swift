@@ -44,7 +44,8 @@ extension ShaderSource {
 
     // Floats as unsigned keys in the same order (-inf lowest, +inf highest).
     inline uint order_key(float v) {
-        const uint b = as_type<uint>(v);
+        // v + 0 turns -0 into +0, which compare equal as floats and must share a key.
+        const uint b = as_type<uint>(v + 0.0f);
         return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
     }
 
