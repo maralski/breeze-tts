@@ -148,6 +148,33 @@ final class CodecProductTests: CodecTestCase {
         }
     }
 
+    /// A product whose K is shared out over simdgroups equals the offline conv for every split,
+    /// with taps, a bias, an N tail and a row tail in the path, and a row's bits do not depend
+    /// on how many rows its step holds.
+    func testSplitProductMatchesConvInAnyStepSize() throws {
+        let cin = 64, out = 44, taps = 7, total = 21
+        var rng = RNG(state: 77)
+        let x = random(&rng, rows: total + taps - 1, width: cin)
+        let w = rng.floats(out * cin * taps, scale: 0.2), b = rng.floats(out)
+        let conv = try loader(["c.weight": ([out, cin, taps], w), "c.bias": ([out], b)]).conv("c", out: out, in: cin, kernel: taps)
+        let want = Array(CodecReference.conv(x, w: w, bias: b, out: out, cin: cin, kernel: taps)[(taps - 1)...])
+        let input = try rowsBuffer(x)
+        for split in CodecKernels.splits {
+            let whole = try nanRows(total, out)
+            try run { ck.product($0, split: split, CodecWindow(input, ld: cin), rows: total, conv, main: ActView(whole, ld: out)) }
+            let got = whole.floats(count: total * out)
+            assertRows(got, want, atol: 3e-5, "split \(split)")
+            XCTAssertTrue(whole.floats(count: out, offset: total * out * 4).allSatisfy(\.isNaN), "rows past M are untouched")
+            let stepped = try nanRows(total, out)
+            var head = 0
+            for step in [1, 1, 9, 3, 7] {
+                try run { ck.product($0, split: split, CodecWindow(input, offset: head * cin * 4, ld: cin), rows: step, conv, main: ActView(stepped, offset: head * out * 4, ld: out)) }
+                head += step
+            }
+            XCTAssertEqual(stepped.floats(count: total * out).map(\.bitPattern), got.map(\.bitPattern), "split \(split) in steps")
+        }
+    }
+
     /// The transposed conv as a two-tap product over [x[t - 1], x[t]] equals torch's
     /// ConvTranspose1d trimmed on the right, streamed in steps, for the vocoder's four rates
     /// and the kernel-equals-stride upsample.

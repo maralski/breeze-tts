@@ -23,17 +23,24 @@ public enum CodecBench {
         public init() {}
     }
 
-    /// A kernel schedule: "default", "tMxN" (one tile for every product) or "sgN" (simdgroups
-    /// per threadgroup), joined with "+".
+    /// A kernel schedule: "default", "tMxN" (one tile for every product), "sgN" (simdgroups
+    /// per threadgroup), "splitN" (the most simdgroups sharing the K of a decoder product, 1 for
+    /// the tile kernel everywhere) or "minN" (the shortest walk of K a simdgroup takes), joined
+    /// with "+".
     struct Variant {
         let name: String
         var tile: CodecKernels.Tile?
         var simdgroups = 4
+        var splitMax = CodecKernels.splitMax, splitMinSteps = CodecKernels.splitMinSteps
 
         init?(_ name: String) {
             self.name = name
             for part in name.split(separator: "+") where part != "default" {
-                if part.hasPrefix("sg"), let n = Int(part.dropFirst(2)), n >= 1, n <= 8 {
+                if part.hasPrefix("split"), let n = Int(part.dropFirst(5)), n >= 1 {
+                    splitMax = n
+                } else if part.hasPrefix("min"), let n = Int(part.dropFirst(3)), n >= 1 {
+                    splitMinSteps = n
+                } else if part.hasPrefix("sg"), let n = Int(part.dropFirst(2)), n >= 1, n <= 8 {
                     simdgroups = n
                 } else if part.hasPrefix("t"), case let dims = part.dropFirst().split(separator: "x").compactMap({ Int($0) }), dims.count == 2,
                           CodecKernels.tiles.contains(CodecKernels.Tile(tm: dims[0], tn: dims[1])) {
@@ -47,6 +54,8 @@ public enum CodecBench {
         func apply() {
             CodecKernels.tileOverride = tile
             CodecKernels.simdgroups = simdgroups
+            CodecKernels.splitMax = splitMax
+            CodecKernels.splitMinSteps = splitMinSteps
         }
     }
 
@@ -210,6 +219,29 @@ public enum CodecBench {
             print(String(format: "  parts sum to %.2f ms when each runs alone in its own command buffer", total))
         }
 
+        if ProcessInfo.processInfo.environment["BREEZE_TRACE"] != nil {
+            decoder.reset()
+            let traced = 6
+            var rows: [String: DispatchTrace.Row] = [:]
+            for f in 0..<traced {
+                let step = decoder.append(codes: codes, codesOffset: f * 64)
+                let cb = ctx.queue.makeCommandBuffer()!
+                guard let trace = try DispatchTrace(ctx: ctx, commandBuffer: cb, capacity: step.dispatches.count) else { break }
+                let e = Encoder(k: kernels, trace: trace)
+                for d in step.dispatches { d(e) }
+                e.ce.endEncoding()
+                cb.commit()
+                try finish(cb)
+                if f == 0 { continue }
+                for r in try trace.rows() {
+                    let key = "\(r.kernel) \(r.weightBytes)"
+                    rows[key, default: DispatchTrace.Row(kernel: r.kernel, weightBytes: r.weightBytes)].count += r.count
+                    rows[key]!.seconds += r.seconds
+                }
+            }
+            print("codec frame traced, one pass per dispatch (rows scaled to the traced frame's span, which pass boundaries lengthen):")
+            print(DispatchTrace.report(rows.values.sorted { $0.seconds > $1.seconds }, frames: traced - 1))
+        }
         if o.tokenLoop { try tokenLoop(directory: directory, ctx: ctx, kernels: kernels, decoder: decoder, options: o) }
     }
 
@@ -237,10 +269,35 @@ public enum CodecBench {
             }
             decoder.reset()
         }
-        var gpu: [[Double]] = [[], []], wall: [[Double]] = [[], []]
-        var finite = true, sums: Set<UInt64> = []
+        /// What a frame's command buffer holds. BREEZE_CODEC_SCHEDULES=tiles adds the codec with
+        /// its products on the tile kernel alone, K not shared out; "sg4" adds the token loop
+        /// alone and with the codec on the scalar GEMV's four-simdgroup layout.
+        struct Schedule {
+            let name: String
+            var codec = true
+            var splitMax = CodecKernels.splitMax
+            var layout: GemvLayout?
+        }
+        let shippedSplit = CodecKernels.splitMax
+        defer { CodecKernels.splitMax = shippedSplit }
+        var schedules = [Schedule(name: "token loop alone", codec: false), Schedule(name: "token loop + codec")]
+        for spec in (ProcessInfo.processInfo.environment["BREEZE_CODEC_SCHEDULES"] ?? "").split(separator: ",") {
+            switch spec {
+            case "tiles": schedules.append(Schedule(name: "token loop + codec on the tile kernel", splitMax: 1))
+            case "sg4":
+                schedules.append(Schedule(name: "four-simdgroup GEMV, token loop alone", codec: false, layout: .fourSimdgroups))
+                schedules.append(Schedule(name: "four-simdgroup GEMV, token loop + codec", layout: .fourSimdgroups))
+            default: throw BreezeTTSError.badInput("unknown codec schedule \(spec)")
+            }
+        }
+        defer { Encoder.gemvLayoutOverride = nil }
+        var gpu = [[Double]](repeating: [], count: schedules.count), wall = gpu
+        var finite = true, sums: [Int: Set<UInt64>] = [:], codeSums: Set<UInt64> = []
         for round in 0..<(o.rounds + 1) {
-            for withCodec in (round % 2 == 0 ? [false, true] : [true, false]) {
+            for i in (round % 2 == 0 ? Array(schedules.indices) : schedules.indices.reversed()) {
+                let sch = schedules[i]
+                CodecKernels.splitMax = sch.splitMax
+                Encoder.gemvLayoutOverride = sch.layout
                 start()
                 let w0 = Date()
                 var buffers: [MTLCommandBuffer] = []
@@ -248,7 +305,7 @@ public enum CodecBench {
                     let cb = ctx.queue.makeCommandBuffer()!
                     let e = Encoder(k: kernels, ce: cb.makeComputeCommandEncoder(dispatchType: o.concurrent ? .concurrent : .serial)!, fenced: o.concurrent)
                     loop.encodeFrame(e, frame: f, settings: settings)
-                    if withCodec {
+                    if sch.codec {
                         for d in decoder.append(codes: loop.codes, codesOffset: f * BreezeShape.codebooks * 4).dispatches { d(e) }
                     }
                     e.ce.endEncoding()
@@ -259,24 +316,32 @@ public enum CodecBench {
                     cb.waitUntilCompleted()
                     if let e = cb.error { throw BreezeTTSError.gpuFailure("\(e)") }
                 }
-                if withCodec {
+                if sch.codec {
                     var hash: UInt64 = 1469598103934665603
                     for v in decoder.pcm.floats(count: o.frames * CodecShape.samplesPerFrame) {
                         hash = (hash ^ UInt64(v.bitPattern)) &* 1099511628211
                         if !v.isFinite { finite = false }
                     }
-                    sums.insert(hash)
+                    sums[sch.splitMax, default: []].insert(hash)
+                    codeSums.insert(loop.codes.contents().withMemoryRebound(to: UInt32.self, capacity: o.frames * BreezeShape.codebooks) { p in
+                        (0..<(o.frames * BreezeShape.codebooks)).reduce(UInt64(1469598103934665603)) { ($0 ^ UInt64(p[$1])) &* 1099511628211 }
+                    })
                 }
                 if round > 0 {
-                    gpu[withCodec ? 1 : 0].append((buffers.last!.gpuEndTime - buffers[0].gpuEndTime) / Double(o.frames - 1) * 1e3)
-                    wall[withCodec ? 1 : 0].append(Date().timeIntervalSince(w0) / Double(o.frames) * 1e3)
+                    gpu[i].append((buffers.last!.gpuEndTime - buffers[0].gpuEndTime) / Double(o.frames - 1) * 1e3)
+                    wall[i].append(Date().timeIntervalSince(w0) / Double(o.frames) * 1e3)
                 }
             }
         }
         print("token loop (guided, backbone at positions [300, 260]) with the codec in the same command buffer, \(o.frames) frames per run, \(o.rounds) interleaved rounds:")
-        print(String(format: "  token loop alone: gpu %@ ms per frame, wall %@ ms", span(gpu[0]), span(wall[0])))
-        print(String(format: "  token loop + codec: gpu %@ ms per frame, wall %@ ms; realtime factor %.2f of an 80 ms frame", span(gpu[1]), span(wall[1]), median(gpu[1]) / 80))
-        print(String(format: "  codec adds %.2f ms per frame; work check: samples finite \(finite), pcm identical in every run \(sums.count == 1), loop status clean \(loop.statusWord == 0)",
-                     median(gpu[1]) - median(gpu[0])))
+        for (i, sch) in schedules.enumerated() {
+            print(String(format: "  %@: gpu %@ ms per frame, wall %@ ms; realtime factor %.2f of an 80 ms frame", sch.name, span(gpu[i]), span(wall[i]), median(gpu[i]) / 80))
+            if i > 0 {
+                // Each round runs every schedule once, so a round's difference shares its noise.
+                let d = zip(gpu[i], gpu[0]).map { $0 - $1 }
+                print(String(format: "    above the token loop alone, per round: %+.2f [%+.2f to %+.2f] ms", median(d), d.min()!, d.max()!))
+            }
+        }
+        print("  work check: samples finite \(finite), pcm identical in every run and schedule of one kernel choice \(sums.values.allSatisfy { $0.count == 1 }), codes identical in every run and schedule \(codeSums.count == 1), loop status clean \(loop.statusWord == 0)")
     }
 }

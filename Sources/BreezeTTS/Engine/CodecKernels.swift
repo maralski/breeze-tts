@@ -98,6 +98,9 @@ final class CodecKernels: @unchecked Sendable {
     struct Tile: Hashable { let tm, tn: Int }
     static let tiles = [Tile(tm: 1, tn: 2), Tile(tm: 1, tn: 4), Tile(tm: 1, tn: 8), Tile(tm: 2, tn: 2), Tile(tm: 2, tn: 4), Tile(tm: 4, tn: 2), Tile(tm: 4, tn: 4)]
     let gemm: [Tile: MTLComputePipelineState]
+    /// The K-split kernel by simdgroups per output block.
+    static let splits = [2, 4, 8]
+    let split: [Int: MTLComputePipelineState]
     let direct, norm, dwconvLN, swiglu, zero, rvqSum, vqNearest, ropeKV, attentionShort, attentionLong: MTLComputePipelineState
 
     /// Keys one query of `attentionShort` can see.
@@ -109,6 +112,9 @@ final class CodecKernels: @unchecked Sendable {
         var g: [Tile: MTLComputePipelineState] = [:]
         for t in Self.tiles { g[t] = try ctx.pipeline("cgemm_\(t.tm)_\(t.tn)") }
         gemm = g
+        var s: [Int: MTLComputePipelineState] = [:]
+        for ks in Self.splits { s[ks] = try ctx.pipeline("csplit_\(ks)") }
+        split = s
         direct = try ctx.pipeline("cconv_direct")
         norm = try ctx.pipeline("codec_norm")
         dwconvLN = try ctx.pipeline("codec_dwconv_ln")
@@ -131,6 +137,19 @@ final class CodecKernels: @unchecked Sendable {
     /// 1x2 5.18 ms, 2x2 5.22, 1x4 5.46, 4x2 5.80, 2x4 5.98, 1x8 6.66, 4x4 7.58.
     static func tile() -> Tile { tileOverride ?? Tile(tm: 1, tn: 2) }
 
+    /// The most simdgroups that share the K of one output block. Measured on an M3 Max over a
+    /// streamed frame (--bench-codec, 7 interleaved rounds): 5.18 ms with none, 3.57 to 3.83 ms
+    /// for 4 to 32 with walks of 8 to 32 steps, not separable; eight keeps a threadgroup at 256
+    /// threads. Overridable for the bench; 1 sends every product to the tile kernel.
+    nonisolated(unsafe) static var splitMax = 8
+    /// The shortest walk of K, in 8-wide steps, worth a simdgroup of its own. Overridable for the bench.
+    nonisolated(unsafe) static var splitMinSteps = 8
+    /// Simdgroups per output block for a layer: as many as `splitMax` allows while each still
+    /// walks `splitMinSteps` steps. It depends on the layer alone, never on the rows of a step.
+    static func splitCount(for conv: CodecConv) -> Int {
+        splits.last { $0 <= splitMax && conv.k / 8 / $0 >= splitMinSteps } ?? 1
+    }
+
     /// Multiply-adds of the products encoded while `countsWork` is set (rows x columns x K).
     /// The bench's work count; off otherwise, so encoding threads share no counter.
     nonisolated(unsafe) static var multiplyAdds = 0
@@ -142,8 +161,10 @@ final class CodecKernels: @unchecked Sendable {
 
     /// One conv, transposed conv or linear layer over `m` output rows (see `cgemm_kernel`).
     /// `main` receives the raw result, added to what it holds with `accumulate`; `act` the
-    /// activated copy.
-    func product(_ e: Encoder, _ x: CodecWindow, rows m: Int, _ conv: CodecConv, main: ActView? = nil, accumulate: Bool = false, act: CodecActOutput? = nil) {
+    /// activated copy. With `split` above one that many simdgroups of a threadgroup share K
+    /// out (see `csplit_kernel`); a layer must pass the same value at every row count, since
+    /// the count orders the sum.
+    func product(_ e: Encoder, split: Int = 1, _ x: CodecWindow, rows m: Int, _ conv: CodecConv, main: ActView? = nil, accumulate: Bool = false, act: CodecActOutput? = nil) {
         struct P { var M, N, cin, taps, xld, rowStep, tapStep, yld, flags, sg, zRows, zRow0, zc, zld: UInt32 }
         precondition(main != nil || act != nil, "a product needs an output")
         precondition(!accumulate || main != nil, "accumulate adds to the main output")
@@ -164,10 +185,12 @@ final class CodecKernels: @unchecked Sendable {
         }
         if Self.countsWork { Self.multiplyAdds += m * conv.n * conv.k }
         let tiled = conv.cin % 8 == 0 && conv.n >= 8
-        let tile = Self.tile()
+        let ks = tiled ? split : 1
+        precondition(ks == 1 || Self.splits.contains(ks))
+        let tile = ks > 1 ? Tile(tm: 1, tn: 2) : Self.tile()
         let blocks = (conv.n + 8 * tile.tn - 1) / (8 * tile.tn)
         let sg = min(Self.simdgroups, blocks)
-        e.start(tiled ? gemm[tile]! : direct, weightBytes: conv.n * conv.k * 4)
+        e.start(ks > 1 ? self.split[ks]! : tiled ? gemm[tile]! : direct, weightBytes: conv.n * conv.k * 4)
         let ce = e.ce
         ce.setBuffer(x.buffer, offset: x.offset, index: 0)
         ce.setBuffer(conv.w.buffer, offset: conv.w.offset, index: 1)
@@ -181,13 +204,21 @@ final class CodecKernels: @unchecked Sendable {
         setBytes(e, P(M: UInt32(m), N: UInt32(conv.n), cin: UInt32(conv.cin), taps: UInt32(conv.taps), xld: UInt32(x.ld), rowStep: UInt32(x.rowStep), tapStep: UInt32(x.tapStep),
                       yld: UInt32(main?.ld ?? 0), flags: flags, sg: UInt32(sg), zRows: UInt32(act?.ringRows ?? 0), zRow0: UInt32(act?.row0 ?? 0),
                       zc: UInt32(act?.channels ?? 1), zld: UInt32(act?.ld ?? 0)), index: 7)
-        if tiled {
+        if ks > 1 {
+            ce.dispatchThreadgroups(MTLSize(width: blocks, height: (m + 7) / 8, depth: 1), threadsPerThreadgroup: MTLSize(width: 32 * ks, height: 1, depth: 1))
+        } else if tiled {
             ce.dispatchThreadgroups(MTLSize(width: (blocks + sg - 1) / sg, height: (m + 8 * tile.tm - 1) / (8 * tile.tm), depth: 1),
                                     threadsPerThreadgroup: MTLSize(width: 32 * sg, height: 1, depth: 1))
         } else {
             let across = min(conv.n, 32)
             ce.dispatchThreads(MTLSize(width: conv.n, height: m, depth: 1), threadsPerThreadgroup: MTLSize(width: across, height: max(1, 32 / across), depth: 1))
         }
+    }
+
+    /// `product` for a decoder that streams a frame at a time: the layer's K shared out as
+    /// `splitCount` says, at every row count.
+    func streamed(_ e: Encoder, _ x: CodecWindow, rows m: Int, _ conv: CodecConv, main: ActView? = nil, accumulate: Bool = false, act: CodecActOutput? = nil) {
+        product(e, split: Self.splitCount(for: conv), x, rows: m, conv, main: main, accumulate: accumulate, act: act)
     }
 
     /// RMSNorm (`bias` nil) or LayerNorm of `rows` rows of `width` floats.
