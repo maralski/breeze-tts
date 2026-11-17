@@ -170,32 +170,32 @@ final class CodecDecoder {
         let sumsView = ActView(sums, ld: 2 * CodecShape.codebookDim), quantizedView = ActView(quantized, ld: h)
         list.append { k.rvqSum($0, codebooks: w.codebooks, codes: codes, codesOffset: codesOffset, rows: f, sumsView) }
         let preRing = self.preRing
-        list.append { k.product($0, CodecWindow(sumsView), rows: f, w.quantizerProj, main: quantizedView, act: preRing.output(head: n0, .identity)) }
+        list.append { k.streamed($0, CodecWindow(sumsView), rows: f, w.quantizerProj, main: quantizedView, act: preRing.output(head: n0, .identity)) }
         stages["quantizer"] = StageView(buffer: quantized, offset: 0, rows: f, width: h)
         let preView = ActView(preOut, ld: lat)
-        list.append { k.product($0, preRing.window(head: n0), rows: f, w.preConv, main: preView) }
+        list.append { k.streamed($0, preRing.window(head: n0), rows: f, w.preConv, main: preView) }
         stages["pre_conv"] = StageView(buffer: preOut, offset: 0, rows: f, width: lat)
         close("quantizer+pre_conv")
 
         let xView = ActView(x, ld: h), xnView = ActView(xn, ld: h), qkvView = ActView(qkv, ld: 3 * lat)
         let attnView = ActView(attn, ld: lat), gateUpView = ActView(gateUp, ld: 2 * lat), mlpView = ActView(mlp, ld: lat)
-        list.append { k.product($0, CodecWindow(preView), rows: f, w.inputProj, main: xView) }
+        list.append { k.streamed($0, CodecWindow(preView), rows: f, w.inputProj, main: xView) }
         let rope = self.rope, kvRing = self.kvRing, eps = CodecDecoderWeights.rmsEps
         for (i, layer) in w.layers.enumerated() {
             let keys = self.keys[i], values = self.values[i]
             list.append { k.norm($0, xView, rows: f, width: h, weight: layer.norm1, xnView, eps: eps) }
-            list.append { k.product($0, CodecWindow(xnView), rows: f, layer.qkv, main: qkvView) }
+            list.append { k.streamed($0, CodecWindow(xnView), rows: f, layer.qkv, main: qkvView) }
             list.append { k.ropeKV($0, qkvView, rows: f, heads: heads, pos0: n0, ring: kvRing, k: keys, v: values, table: rope) }
             list.append { k.attention($0, qkvView, rows: f, heads: heads, pos0: n0, window: CodecShape.decoderWindow, ring: kvRing, k: keys, v: values, attnView) }
-            list.append { k.product($0, CodecWindow(attnView), rows: f, layer.o, main: xView, accumulate: true) }
+            list.append { k.streamed($0, CodecWindow(attnView), rows: f, layer.o, main: xView, accumulate: true) }
             list.append { k.norm($0, xView, rows: f, width: h, weight: layer.norm2, xnView, eps: eps) }
-            list.append { k.product($0, CodecWindow(xnView), rows: f, layer.gateUp, main: gateUpView) }
+            list.append { k.streamed($0, CodecWindow(xnView), rows: f, layer.gateUp, main: gateUpView) }
             list.append { k.swiglu($0, gateUpView, rows: f, hidden: lat, mlpView) }
-            list.append { k.product($0, CodecWindow(mlpView), rows: f, layer.down, main: xView, accumulate: true) }
+            list.append { k.streamed($0, CodecWindow(mlpView), rows: f, layer.down, main: xView, accumulate: true) }
         }
         let latentView = ActView(latent, ld: lat)
         list.append { k.norm($0, xView, rows: f, width: h, weight: w.finalNorm, xnView, eps: eps) }
-        list.append { k.product($0, CodecWindow(xnView), rows: f, w.outputProj, main: latentView) }
+        list.append { k.streamed($0, CodecWindow(xnView), rows: f, w.outputProj, main: latentView) }
         stages["pre_transformer"] = StageView(buffer: latent, offset: 0, rows: f, width: lat)
         close("transformer")
 
@@ -204,15 +204,15 @@ final class CodecDecoder {
         for (i, (uw, us)) in zip(w.upsample, upsample).enumerated() {
             let rowsIn = f << i, rows = 2 * rowsIn, head = n0 * (2 << i)
             let source = input, outView = ActView(us.out, ld: lat), normedView = ActView(us.normed, ld: lat)
-            list.append { k.product($0, CodecWindow(source), rows: rowsIn, uw.trans, main: outView.strided(2 * lat), act: us.dwRing.output(head: head, .identity)) }
+            list.append { k.streamed($0, CodecWindow(source), rows: rowsIn, uw.trans, main: outView.strided(2 * lat), act: us.dwRing.output(head: head, .identity)) }
             list.append {
                 k.dwconvLN($0, us.dwRing.window(head: head), rows: rows, channels: lat, taps: 7, w: uw.dw, bias: uw.dwBias, lnWeight: uw.lnWeight, lnBias: uw.lnBias,
                            normedView, eps: CodecDecoderWeights.layerNormEps)
             }
-            list.append { k.product($0, CodecWindow(normedView), rows: rows, uw.pw1, act: CodecActOutput(buffer: us.wide, ld: 4 * lat, channels: 4 * lat, activation: .gelu)) }
+            list.append { k.streamed($0, CodecWindow(normedView), rows: rows, uw.pw1, act: CodecActOutput(buffer: us.wide, ld: 4 * lat, channels: 4 * lat, activation: .gelu)) }
             let last = i == w.upsample.count - 1
             list.append {
-                k.product($0, CodecWindow(us.wide, ld: 4 * lat), rows: rows, uw.pw2, main: outView, accumulate: true, act: last ? conv0Ring.output(head: head, .identity) : nil)
+                k.streamed($0, CodecWindow(us.wide, ld: 4 * lat), rows: rows, uw.pw2, main: outView, accumulate: true, act: last ? conv0Ring.output(head: head, .identity) : nil)
             }
             stages["upsample\(i)"] = StageView(buffer: us.out, offset: 0, rows: rows, width: lat)
             input = outView
@@ -221,7 +221,7 @@ final class CodecDecoder {
 
         let conv0View = ActView(conv0Out, ld: CodecDecoderWeights.vocoderWidth), firstBlock = blocks[0], finalRing = self.finalRing
         list.append {
-            k.product($0, conv0Ring.window(head: 4 * n0), rows: 4 * f, w.conv0, main: conv0View, act: firstBlock.transRing.output(head: 4 * n0, w.blocks[0].inAct))
+            k.streamed($0, conv0Ring.window(head: 4 * n0), rows: 4 * f, w.conv0, main: conv0View, act: firstBlock.transRing.output(head: 4 * n0, w.blocks[0].inAct))
         }
         stages["decoder0"] = StageView(buffer: conv0Out, offset: 0, rows: 4 * f, width: CodecDecoderWeights.vocoderWidth)
         close("vocoder conv 1024>1536")
@@ -229,7 +229,7 @@ final class CodecDecoder {
             let c = bw.channels, headIn = n0 * bs.rowsIn, head = n0 * bs.rowsOut, rows = bs.rowsOut * f
             let stream = ActView(bs.stream, ld: c)
             list.append {
-                k.product($0, bs.transRing.window(head: headIn), rows: bs.rowsIn * f, bw.trans, main: stream.strided(bw.stride * c), act: bs.unitRings[0].output(head: head, bw.units[0].act1))
+                k.streamed($0, bs.transRing.window(head: headIn), rows: bs.rowsIn * f, bw.trans, main: stream.strided(bw.stride * c), act: bs.unitRings[0].output(head: head, bw.units[0].act1))
             }
             for (u, unit) in bw.units.enumerated() {
                 let next: CodecActOutput
@@ -241,10 +241,10 @@ final class CodecDecoder {
                     next = finalRing.output(head: head, w.finalAct)
                 }
                 list.append {
-                    k.product($0, bs.unitRings[u].window(head: head, tapStep: unit.dilation), rows: rows, unit.conv1,
+                    k.streamed($0, bs.unitRings[u].window(head: head, tapStep: unit.dilation), rows: rows, unit.conv1,
                               act: CodecActOutput(buffer: bs.branch, ld: c, channels: c, activation: unit.act2))
                 }
-                list.append { k.product($0, CodecWindow(bs.branch, ld: c), rows: rows, unit.conv2, main: stream, accumulate: true, act: next) }
+                list.append { k.streamed($0, CodecWindow(bs.branch, ld: c), rows: rows, unit.conv2, main: stream, accumulate: true, act: next) }
             }
             stages["decoder\(i + 1)"] = StageView(buffer: bs.stream, offset: 0, rows: rows, width: c)
             close("vocoder block x\(bw.stride) to \(c)")
@@ -255,7 +255,7 @@ final class CodecDecoder {
         let pcmOffset = (steps % pcmSlots) * chunkFrames * CodecShape.samplesPerFrame * 4
         let pcm = self.pcm
         list.append {
-            k.product($0, finalRing.window(head: finalHead), rows: samples, w.finalConv, act: CodecActOutput(buffer: pcm, offset: pcmOffset, ld: 1, channels: 1, activation: .clamp))
+            k.streamed($0, finalRing.window(head: finalHead), rows: samples, w.finalConv, act: CodecActOutput(buffer: pcm, offset: pcmOffset, ld: 1, channels: 1, activation: .clamp))
         }
         close("final conv")
         frames += f

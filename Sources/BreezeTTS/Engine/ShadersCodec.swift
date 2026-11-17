@@ -159,6 +159,69 @@ extension ShaderSource {
     CGEMM(4, 2) CGEMM(4, 4)
     #undef CGEMM
 
+    // The same product with K shared out. cgemm's walk of K is one chain of multiply-accumulates
+    // per simdgroup, and a product of few rows waits on that chain with most of the GPU idle.
+    // Here the KS simdgroups of a threadgroup share one 8 x 16 output block: simdgroup s walks
+    // steps [s S / KS, (s + 1) S / KS) of the S = taps * cin / 8 steps of K, and the partial
+    // tiles are added in simdgroup order through threadgroup memory. An element's sum depends
+    // on KS and not on M, so a row decodes to the same bits in any step size.
+    template <int KS>
+    kernel void csplit_kernel(device const float* X [[buffer(0)]],
+                              device const float* W [[buffer(1)]],
+                              device const float* bias [[buffer(2)]],
+                              device float* Y [[buffer(3)]],
+                              device float* Z [[buffer(4)]],
+                              device const float* actA [[buffer(5)]],
+                              device const float* actB [[buffer(6)]],
+                              constant CGemmParams& p [[buffer(7)]],
+                              uint2 tgid [[threadgroup_position_in_grid]],
+                              uint sgid [[simdgroup_index_in_threadgroup]],
+                              uint lane [[thread_index_in_simdgroup]]) {
+        threadgroup float part[KS][32][4];
+        const uint m0 = tgid.y * 8, n0 = tgid.x * 16;
+        const uint K = p.cin * p.taps, perTap = p.cin / 8, steps = p.taps * perTap;
+        const uint xstride = p.rowStep * p.xld;
+        const uint first = sgid * steps / KS, last = (sgid + 1) * steps / KS;
+        uint j = first / perTap, c = (first % perTap) * 8;
+        simdgroup_float8x8 acc0 = simdgroup_float8x8(0.0f), acc1 = simdgroup_float8x8(0.0f);
+        for (uint i = first; i < last; i++) {
+            device const float* xr = X + m0 * xstride + j * p.tapStep * p.xld + c;
+            device const float* wr = W + n0 * K + j * p.cin + c;
+            simdgroup_float8x8 a, b0, b1;
+            simdgroup_load(a, xr, xstride);
+            simdgroup_load(b0, wr, K, ulong2(0, 0), true);
+            simdgroup_load(b1, wr + 8 * K, K, ulong2(0, 0), true);
+            simdgroup_multiply_accumulate(acc0, a, b0, acc0);
+            simdgroup_multiply_accumulate(acc1, a, b1, acc1);
+            c += 8;
+            if (c == p.cin) { c = 0; j++; }
+        }
+        part[sgid][lane][0] = acc0.thread_elements()[0];
+        part[sgid][lane][1] = acc0.thread_elements()[1];
+        part[sgid][lane][2] = acc1.thread_elements()[0];
+        part[sgid][lane][3] = acc1.thread_elements()[1];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sgid != 0) return;
+        float v[4] = { part[0][lane][0], part[0][lane][1], part[0][lane][2], part[0][lane][3] };
+        #pragma clang loop unroll(full)
+        for (int s = 1; s < KS; s++) {
+            v[0] += part[s][lane][0]; v[1] += part[s][lane][1]; v[2] += part[s][lane][2]; v[3] += part[s][lane][3];
+        }
+        const uint m = m0 + (((lane >> 1) & 3) | ((lane >> 4) << 2));
+        if (m >= p.M) return;
+        const uint cc = ((lane & 1) << 1) | (((lane >> 3) & 1) << 2);
+        #pragma clang loop unroll(full)
+        for (int t = 0; t < 2; t++) {
+            const uint n = n0 + 8 * t + cc;
+            if (n < p.N) cg_emit(v[2 * t], m, n, p, bias, Y, Z, actA, actB);
+            if (n + 1 < p.N) cg_emit(v[2 * t + 1], m, n + 1, p, bias, Y, Z, actA, actB);
+        }
+    }
+
+    #define CSPLIT(KS) template [[host_name("csplit_" #KS)]] kernel void csplit_kernel<KS>(device const float*, device const float*, device const float*, device float*, device float*, device const float*, device const float*, constant CGemmParams&, uint2, uint, uint);
+    CSPLIT(2) CSPLIT(4) CSPLIT(8)
+    #undef CSPLIT
+
     // The same product with one thread per output element, for shapes the tiles do not fit: a
     // single input channel, a single output column. Any cin, any N.
     kernel void cconv_direct(device const float* X [[buffer(0)]],
