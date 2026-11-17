@@ -1,0 +1,111 @@
+BreezeTTS
+Copyright 2026 Peter Marelas
+
+BreezeTTS's own code is licensed under the Apache License, Version 2.0
+(see LICENSE).
+
+BreezeTTS is a Swift and Metal port of the inference path of Breeze TTS 2
+by BreezeBlue:
+
+- Code: https://github.com/breezeblue-ai/breeze-tts
+- Model: https://huggingface.co/BreezeBlue/Breeze-TTS-2
+
+THE MODEL WEIGHTS ARE NOT APACHE-LICENSED AND ARE NOT INCLUDED
+
+This repository does not include the Breeze TTS 2 weights, tokenizer or
+audio tokenizer. Download them from the Hugging Face repository above.
+BreezeBlue publishes them under the BreezeBlue Research and Non-Commercial
+License Agreement, not under the Apache License. That agreement permits
+research and non-commercial use only and grants no commercial rights. It
+also covers outputs: any commercial purpose involving the weights, a
+derivative model or audio they generate requires a separate written
+commercial license from BreezeBlue (https://breezeblue.ai). Read the
+LICENSE file in the Hugging Face repository before you use the weights.
+The Apache License of this code grants no right to use the model.
+
+Breeze TTS 2 is licensed under the BreezeBlue Research and Non-Commercial
+License Agreement. Copyright (c) 2026 RESONIA, INC. All Rights Reserved.
+
+The audio tokenizer (the codec that turns audio into codes and back) is
+based on Qwen3-TTS by the Alibaba Qwen team
+(https://github.com/QwenLM/Qwen3-TTS), which is licensed under the Apache
+License, Version 2.0.
+
+CODE THAT FOLLOWS UPSTREAM CODE
+
+The upstream Breeze TTS 2 inference code is licensed under the Apache
+License, Version 2.0. Parts of BreezeTTS follow it closely: the four prompt
+templates and their segment layout (Sources/BreezeTTS/Text/BreezePrompt.swift,
+BreezeRequest.swift), the sampling rules (temperature, top-k, the
+repetition penalty, suppressed ids, classifier-free guidance; Engine/Sampling.swift
+and the sampling shaders), the generation loop and its stop conditions
+(Engine/Synthesis.swift, Engine/FrameLoop.swift), and the network
+definitions of the text encoder, backbone and depth decoder (Engine/).
+The upstream files carry these notices:
+
+    Copyright 2025 Sesame and The HuggingFace Inc. team. All rights reserved.
+    Copyright 2025 The HuggingFace Inc. team. All rights reserved.
+
+The codec decoder and encoder (Engine/Codec*.swift) follow the network
+definitions of the Qwen3-TTS 12 Hz tokenizer and of the Mimi encoder in
+Hugging Face Transformers, which carry these notices:
+
+    Copyright 2026 The Qwen team, Alibaba Group and the HuggingFace Inc. team. All rights reserved.
+    Copyright 2026 The Alibaba Qwen team.
+    Copyright 2024 Kyutai, and the HuggingFace Inc. team. All rights reserved.
+
+These files are licensed under the Apache License, Version 2.0 (the
+"License"); you may not use them except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+License for the specific language governing permissions and limitations
+under the License.
+
+BreezeTTS is a reimplementation in Swift and Metal, not a copy of these
+files: the computations follow them, and the code is new.
+
+The test fixtures in Tests/BreezeTTSTests/Fixtures hold outputs of the
+upstream prompt templates and of the Hugging Face tokenizer for the
+checkpoint's tokenizer.json.
+
+CODE FROM MINGTTS
+
+trimTrailingSilence (Sources/BreezeTTS/Voice/Silence.swift) and the
+reference-clip resampler (Sources/BreezeTTS/Engine/CodecResample.swift)
+come from MingTTS (Apache-2.0, same author). trimTrailingSilence ports
+frontend.audio_processing.trim_trailing_silence from inclusionAI's
+Ming-3.0-tts (https://github.com/inclusionAI/Ming-3.0-tts), which carries
+this notice:
+
+    MIT License
+
+    Copyright (c) 2025 inclusionAI
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.
+
+NON-AFFILIATION
+
+Breeze TTS 2 is a model of BreezeBlue, the business name of RESONIA, INC.
+This project is not affiliated with or endorsed by BreezeBlue, RESONIA,
+INC., the Alibaba Qwen team or inclusionAI.
