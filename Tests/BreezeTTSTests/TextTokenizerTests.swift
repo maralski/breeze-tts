@@ -62,9 +62,9 @@ private let isRelease: Bool = {
     #expect(tokenizer.encode("[S0]Hello world.") == [262146, 9259, 1902, 236761])
 }
 
-/// Measured on an M3 Max in release: load 0.13 s, a 2,000-character paragraph 0.4 ms. The
-/// bounds leave room for a slower machine while still catching a JSONSerialization-sized
-/// regression (0.6 s before any table is built) or a quadratic merge loop.
+/// Measured on an M3 Max in release: load 0.15 to 0.16 s, this 1,890-character paragraph (one
+/// BPE word, since only added tokens split it) 0.28 ms. The bounds leave room for a slower machine
+/// while still catching a return to JSONSerialization, which spends 0.6 s before any table is built.
 @Test(.enabled(if: textTokenizerURL != nil && isRelease, "release build with the Breeze-TTS-2 tokenizer.json"))
 func textTokenizerLoadsAndEncodesFast() throws {
     let url = try #require(textTokenizerURL)

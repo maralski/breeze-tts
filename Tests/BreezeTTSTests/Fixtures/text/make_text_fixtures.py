@@ -72,7 +72,7 @@ corpus = [
     "(clears throat) We need to discuss what happened last night.", "(cough) Sorry. (laugh)",
     "[笑] 欢迎来到今晚的故事时间，让我们一起开始吧。", "[叹气] 没想到过了这么久，你还记得我的声音。", "[咳嗽][清嗓子]好的。",
     "(laugh)(laugh)(laugh)", "[笑][笑]", "( laugh )", "[ 笑 ]", "(Laugh)", "[S0](laugh)", "[S0][笑]",
-    "[S0]", "[S1]", "[S9]", "[S10]", "[s0]", "[S0]Hello world.", "[S0][S1][S2]", "[S0] [S1]", "[S 0]", "[S0",
+    "[S0][S1][S2][S3][S4][S5][S6][S7][S8][S9]", "[S0]", "[S1]", "[S9]", "[S10]", "[s0]", "[S0]Hello world.", "[S0][S1][S2]", "[S0] [S1]", "[S 0]", "[S0",
     "S0]", "[[S0]]", "<ins_bos>", "<ins_eos>", "<ins_bos>Speak warmly.<ins_eos>Hello.", "<ins_bos ><ins_eos>",
     "<|AUDIO|>", "<|audio_eos|>", "<|AUDIO|><|AUDIO|><|audio_eos|>", "<|AUDIO|>x<|audio_eos|>", "<| AUDIO |>",
     "<|AUDIO", "AUDIO|>", "<|audio|>", "< bos>", "<bos >", "<b os>", "<bos>", "<bos><bos>", "x<bos>y", "<eos>",
@@ -169,7 +169,7 @@ def ref_codes(frames):
     return [[rng.randrange(2048) for _ in range(16)] for _ in range(frames)]
 
 texts = ["Hello world.", "(sigh) It is good to hear your voice again after all this time.", "[笑] 欢迎来到今晚的故事时间，让我们一起开始吧。",
-         "  leading spaces kept", "line\nbreak and\ttab", "混合 mixed 文本 (laugh) 123。", "a" * 300]
+         "  leading spaces kept", "line\nbreak and\ttab", "混合 mixed 文本 (laugh) 123。", "a" * 300, "a ▁▁ b ▁"]
 instructions = ["Speak slowly with a restrained, serious tone.", "一位温柔自信的年轻女性，声音清晰。", "  padded instruction  "]
 transcripts = ["This is the exact transcript of the reference audio.", "这是中文参考音频的准确文字稿。", "  padded transcript\n"]
 
