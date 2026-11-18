@@ -71,7 +71,7 @@ To measure speed, run `breeze-tts --bench` under `scripts/gpulock.py`. `breeze-t
 Add the package to your `Package.swift`:
 
 ```swift
-.package(url: "https://github.com/maralski/breeze-tts.git", from: "0.1.0")
+.package(url: "https://github.com/maralski/breeze-tts.git", from: "0.2.0")
 ```
 
 Then load the model once and stream audio:
