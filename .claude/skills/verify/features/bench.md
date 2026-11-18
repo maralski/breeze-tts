@@ -5,6 +5,7 @@
 ## Sub-features
 
 - `bench-run` prints a `bench <case>:` header, one `run N:` line per run, and one `summary <case>:` line, for the cases `plain` and `design`.
+- `bench-compare` loads the model as bf16 and as int8 with `--compare-depth-weights` and takes turns between them run by run, then prints a `summary <case> bf16:` and a `summary <case> int8:` line and a `paired <case>:` line.
 - `bench-repeat` sets the number of measured runs with `--repeat n`. Run `i` uses seed `i`.
 
 ## How to get to it (user POV)
@@ -19,6 +20,7 @@ Preconditions:
 - `$V/doctor.sh` exits 0 with no `breeze-tts already running` warning.
 - Nothing else heavy is using the GPU. Other worktrees' benchmarks wait on the same lock, but a `--say` or a test run that skips the lock still competes.
 
+- **Compare.** Run `$V/drive.sh bench-compare -- --bench --repeat 5 --compare-depth-weights`. Exit 0. Two `loaded` lines, the second ending `depth decoder MLP weights as int8`. For each case, run lines tagged `bf16` and `int8` in alternating order, both summaries, and `paired plain: int8 over bf16 frames/s M [lo-hi], ms per frame M [lo-hi], int8 faster in N of 5 runs`.
 - **Run.** Run `$V/drive.sh bench-run -- --bench --repeat 5`. Exit 0. For each case, stdout has a header such as `bench plain: guidance 1.0, N prompt rows, one warm-up run, then 5 runs with seeds 1...5`, five lines such as `run 1: N frames, N s audio, wall N s, N s audio/s, N frames/s, first audio N ms, prefill N ms, stopped true`, and a line `summary plain: audio/s M [lo-hi], first audio ms M [lo-hi], frames/s M [lo-hi]; median [min-max] of 5 runs`. No WAV is written.
 - **Read it.** Every `run` line must say `stopped true`. Seconds of audio per second above 1.0 means faster than real time. First audio counts from the request to the first 80 ms chunk and includes the prompt and the prefill, not the model load.
 

@@ -39,7 +39,7 @@ Keep implementation details out of the map. Name only user paths, stable handles
 
 ## Features
 
-- [Speak text](./speak.md) covers `--say` in the model's own voice and with `--instruction`, Chinese text with a vocal event, long text in fragments, seeds, greedy decoding, checkpoint discovery and bad arguments.
+- [Speak text](./speak.md) covers `--say` in the model's own voice and with `--instruction`, Chinese text with a vocal event, long text in fragments, seeds, greedy decoding, int8 depth-decoder weights, checkpoint discovery and bad arguments.
 - [Clone a voice](./clone.md) covers `--clone` with `--transcript`, and voice direction with `--instruction` added.
 - [Golden parity](./parity.md) covers `--parity` against tensors captured from the Python reference, and greedy audio against the reference PCM.
 - [Benchmark](./bench.md) covers `--bench`.

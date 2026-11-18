@@ -8,6 +8,7 @@
     python3 tools/quant/study.py asr --out DIR       # Whisper; a Python with openai-whisper
     .venv/bin/python tools/quant/study.py spk --out DIR   # CAM++; needs onnxruntime, CAMPPLUS_ONNX
     python3 tools/quant/study.py gate --out DIR      # the decision rule, printed and saved
+    python3 tools/quant/study.py clips --out DIR --to DIR2   # A/B listening pairs with an index
 
 Every step resumes: it skips what DIR already holds. Build the tool first (swift build -c release).
 BREEZE_TOOL names another binary. `run` records the binary's SHA-256 in DIR/tool.txt and refuses
@@ -197,7 +198,7 @@ def cmd_spk(args):
             for a, b in pairs:
                 ea, eb = emb(a), emb(b)
                 sims.append(None if ea is None or eb is None else float(ea @ eb))
-            sim = None if not sims or any(s is None for s in sims) else min(sims)
+            sim = None if not sims or any(s is None or math.isnan(s) for s in sims) else min(sims)
             with open(d / "spk.jsonl", "a") as f:
                 f.write(json.dumps(dict(id=it["id"], sim=sim, sims=sims)) + "\n")
         print(arm, "done", flush=True)
@@ -240,6 +241,8 @@ def load_runs(out):
             frames = sum(f["frames"] for f in r["fragments"])
             runs[arm, it["id"]] = dict(stopped=all(f["stopped"] for f in r["fragments"]), frames=frames, fpu=frames / it["units"],
                                        err=asr[it["id"]]["err"], sim=spk[it["id"]]["sim"] if it["id"] in spk else None, transcript=asr[it["id"]]["transcript"])
+            if runs[arm, it["id"]]["sim"] is not None and math.isnan(runs[arm, it["id"]]["sim"]):
+                runs[arm, it["id"]]["sim"] = None
     return items, runs
 
 
@@ -294,7 +297,10 @@ def cmd_gate(args):
     say("metric\tpairs\tbf16 mean\tint8 mean\tint8 - bf16\tmargin\tp\tverdict")
     for key, name, margin, sign in (("err", "G5 error rate", 0.010, 1), ("sim", "G6 speaker similarity", 0.010, -1)):
         pairs = [(runs[a, it["id"]][key], runs[b, it["id"]][key]) for it in items for a, b in PAIRS]
+        asked = len(pairs) if key == "err" else 2 * sum(1 for it in items if it["stratum"] in SPEAKER_STRATA)
         pairs = [(x, y) for x, y in pairs if x is not None and y is not None]
+        if len(pairs) != asked:
+            say(f"note: {name} has {len(pairs)} of {asked} pairs; a run with no computable value is left out here and flagged under G4")
         d = [sign * (y - x) for x, y in pairs]
         mean0, mean1 = statistics.fmean(x for x, _ in pairs), statistics.fmean(y for _, y in pairs)
         p = sign_flip_p(d)
@@ -336,15 +342,39 @@ def cmd_gate(args):
     sys.exit(0 if not failed else 1)
 
 
+def cmd_clips(args):
+    """The first two items of every stratum and language, arm A (bf16) and arm B (int8), same seed."""
+    import shutil
+    out, to = Path(args.out).resolve(), Path(args.to).resolve()
+    to.mkdir(parents=True, exist_ok=True)
+    items, runs = load_runs(out)
+    seen, rows = {}, ["file_bf16\tfile_int8\tstratum\tlang\tseed\tframes_bf16\tframes_int8\terr_bf16\terr_int8\tvoice\tinstruction\ttext"]
+    for it in items:
+        key = (it["stratum"], it["lang"], bool(it["instruction"]))
+        if seen.get(key, 0) >= (1 if it["stratum"] in ("zh", "tags", "long") else 2):
+            continue
+        seen[key] = seen.get(key, 0) + 1
+        names = []
+        for arm, fmt in (("A", "bf16"), ("B", "int8")):
+            names.append(f"{it['id']}.{fmt}.wav")
+            shutil.copyfile(out / arm / f"{it['id']}.wav", to / names[-1])
+        a, b = runs["A", it["id"]], runs["B", it["id"]]
+        rows.append("\t".join(map(str, [*names, it["stratum"], it["lang"], it["seed"], a["frames"], b["frames"], f"{a['err']:.3f}", f"{b['err']:.3f}",
+                                        it["voice"] or "", it["instruction"] or "", it["text"]])))
+    (to / "index.tsv").write_text("\n".join(rows) + "\n")
+    print(f"{len(rows) - 1} pairs in {to}")
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
-    for name, fn in (("plan", cmd_plan), ("run", cmd_run), ("asr", cmd_asr), ("spk", cmd_spk), ("gate", cmd_gate)):
+    for name, fn in (("plan", cmd_plan), ("run", cmd_run), ("asr", cmd_asr), ("spk", cmd_spk), ("gate", cmd_gate), ("clips", cmd_clips)):
         s = sub.add_parser(name)
         s.add_argument("--out", required=True)
         s.add_argument("--arms", nargs="+", default=list(ARMS), choices=list(ARMS))
         s.add_argument("--chunk", type=int, default=20)
         s.add_argument("--voices", action="store_true", help="asr: also transcribe the reference voices")
+        s.add_argument("--to", help="clips: the directory to fill")
         s.set_defaults(fn=fn)
     args = p.parse_args()
     args.fn(args)

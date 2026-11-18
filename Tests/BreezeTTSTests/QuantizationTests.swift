@@ -143,6 +143,8 @@ final class QuantizationTests: GPUTestCase {
 
     /// The depth decoder's MLP shapes at every row count the frame loop dispatches: one row, the
     /// two rows of a guided step or of an unguided first pair, the four of a guided first pair.
+    /// The depth decoder's MLP shapes at every row count the frame loop dispatches: one row, the
+    /// two rows of a guided step or of an unguided first pair, the four of a guided first pair.
     func testDepthShapes() throws {
         for m in [1, 2, 4] {
             try int8Case(m: m, n: 8192, k: 1024, flags: .siluGate)
@@ -201,5 +203,31 @@ final class QuantizationTests: GPUTestCase {
         let scale = draws[1].map(abs).max()!
         let worst = zip(draws[0], draws[1]).map { abs($0 - $1) }.max()!
         XCTAssertLessThan(worst, 0.02 * scale, "int8 kernel against the dequantized weights")
+    }
+
+    // MARK: public option
+
+    /// A model loaded with int8 depth weights speaks a guided request to the end, gives the same
+    /// audio for the same seed, and is not the bf16 model: its greedy codes leave the bf16
+    /// model's within the utterance.
+    func testInt8ModelSpeaksAndRepeats() throws {
+        guard let dir = TestEnvironment.weightsDirectory else { throw XCTSkip("no Breeze-TTS-2 checkpoint") }
+        let request = try BreezeRequest(text: "Thank you for calling. How can I help you today?", task: .voiceDesign(instruction: "A calm man with a warm, low voice."))
+        func speak(_ model: BreezeTTSModel, _ options: BreezeSynthesisOptions) throws -> [Float] {
+            var pcm: [Float] = []
+            let reports = try model.synthesize(request, options: options) { _, chunk in pcm += chunk }
+            XCTAssertTrue(reports[0].stopped)
+            XCTAssertGreaterThan(reports[0].frames, 15)
+            XCTAssertLessThan(reports[0].frames, 120)
+            XCTAssertGreaterThan(pcm.map(abs).max() ?? 0, 0.05)
+            return pcm
+        }
+        let int8 = try BreezeTTSModel(directory: dir, depthWeights: .int8)
+        var seeded = BreezeSynthesisOptions()
+        seeded.seed = 5
+        XCTAssertEqual(try speak(int8, seeded), try speak(int8, seeded))
+        var greedy = BreezeSynthesisOptions()
+        greedy.greedy = true
+        XCTAssertNotEqual(try speak(int8, greedy), try speak(try BreezeTTSModel(directory: dir), greedy))
     }
 }
