@@ -23,7 +23,7 @@ final class LinearTests: GPUTestCase {
         let y0 = rng.floats(m * n)
         let xb = try f32Buffer(x), yb = try f32Buffer(y0)
         try run { e in
-            e.linear(ActView(xb, ld: k), rows: m, Linear(w: w, bias: bias ? b : nil, n: n, k: k), ActView(yb, ld: n), flags: flags, gate: flags.isGated ? w2 : nil)
+            e.linear(ActView(xb, ld: k), rows: m, Linear(w: w, bias: bias ? b : nil, n: n, k: k), ActView(yb, ld: n), flags: flags, gate: flags.isGated ? Linear(w: w2, bias: nil, n: n, k: k) : nil)
         }
         var want = [Float](repeating: 0, count: m * n)
         for r in 0..<m {

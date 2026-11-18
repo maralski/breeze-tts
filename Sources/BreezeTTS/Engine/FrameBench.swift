@@ -12,7 +12,9 @@ import Metal
 ///
 /// BREEZE_FRAME_VARIANTS names kernel schedules to compare in the same process, separated by
 /// ";": "default", or rules "MxNxK=sgSrC" joined by ",", each giving one scalar-projection shape
-/// a `GemvLayout`; "*=sgSrC" gives it to every decode shape, and later rules override it. Every variant runs plain and guided in every round, in alternating order;
+/// a `GemvLayout`; "*=sgSrC" gives it to every decode shape, and later rules override it. The rule
+/// "int8" runs the variant on the int8 depth-decoder weights (loaded beside the bf16 ones), and
+/// "i8=sgSrC" gives the int8 kernel a layout. Every variant runs plain and guided in every round, in alternating order;
 /// BREEZE_FRAME_ONLY=guided (or plain) times that mode alone, for more rounds in the same time.
 public enum FrameBench {
     public struct Options {
@@ -38,7 +40,7 @@ public enum FrameBench {
     /// "default", or "MxNxK=sgSrC,..." rules.
     static func overrides(_ spec: String) throws -> [GemvShape: GemvLayout] {
         var out: [GemvShape: GemvLayout] = [:]
-        for rule in spec.split(separator: ",") where rule != "default" {
+        for rule in spec.split(separator: ",") where rule != "default" && rule != "int8" && !rule.hasPrefix("i8=") {
             let sides = rule.split(separator: "="), dims = sides[0].split(separator: "x").compactMap { Int($0) }
             if sides.count == 2, sides[0] == "*", let layout = GemvLayout(String(sides[1])) {
                 for s in GemvBench.shapes { out[GemvShape(m: s.m, n: s.n, k: s.k)] = layout }
@@ -53,6 +55,7 @@ public enum FrameBench {
     struct Mode {
         let name: String
         var overrides: [GemvShape: GemvLayout] = [:]
+        var int8Layout = GemvLayout.int8Shipped
         let settings: FrameSettings
         let loop: FrameLoop
         let positions: [Int]
@@ -73,23 +76,42 @@ public enum FrameBench {
             Encoder.causalDecodeSplit = split
         }
         let t0 = Date()
-        let weights = try FrameWeights(try ShardedCheckpoint(directory: directory), ctx: ctx)
+        let store = try ShardedCheckpoint(directory: directory)
+        let weights = try FrameWeights(store, ctx: ctx)
         print(String(format: "loaded backbone, depth decoder, heads and embedding from %@ in %.1f s", directory.lastPathComponent, Date().timeIntervalSince(t0)))
 
         var guided = FrameSettings()
         guided.guidance = o.guidance
-        let plainLoop = try FrameLoop(ctx: ctx, weights: weights, sequences: 1, maxFrames: o.frames)
-        let guidedLoop = try FrameLoop(ctx: ctx, weights: weights, sequences: 2, maxFrames: o.frames)
         let specs = (ProcessInfo.processInfo.environment["BREEZE_FRAME_VARIANTS"] ?? "default").split(separator: ";").map(String.init)
+        var loops: [Bool: (plain: FrameLoop, guided: FrameLoop)] = [:]
+        func loopPair(int8: Bool) throws -> (plain: FrameLoop, guided: FrameLoop) {
+            if let pair = loops[int8] { return pair }
+            var w = weights
+            if int8 {
+                let t = Date()
+                w = try weights.withDepth(.int8, store: store, ctx: ctx)
+                print(String(format: "quantized the depth decoder's MLP weights to int8 in %.2f s", Date().timeIntervalSince(t)))
+            }
+            let pair = (try FrameLoop(ctx: ctx, weights: w, sequences: 1, maxFrames: o.frames), try FrameLoop(ctx: ctx, weights: w, sequences: 2, maxFrames: o.frames))
+            loops[int8] = pair
+            return pair
+        }
         var modes: [Mode] = []
         for spec in specs {
             let rules = try overrides(spec)
+            let tokens = spec.split(separator: ",")
+            var layout = GemvLayout.int8Shipped
+            if let rule = tokens.first(where: { $0.hasPrefix("i8=") }) {
+                guard let l = GemvLayout(String(rule.dropFirst(3)), columns: Kernels.gemvInt8Columns) else { throw BreezeTTSError.badInput("unknown int8 layout \(rule)") }
+                layout = l
+            }
+            let pair = try loopPair(int8: tokens.contains("int8"))
             let tag = specs.count == 1 ? "" : " [\(spec)]"
-            modes.append(Mode(name: "plain" + tag, overrides: rules, settings: FrameSettings(), loop: plainLoop, positions: [o.positions[0]]))
-            modes.append(Mode(name: "guided" + tag, overrides: rules, settings: guided, loop: guidedLoop, positions: o.positions))
+            modes.append(Mode(name: "plain" + tag, overrides: rules, int8Layout: layout, settings: FrameSettings(), loop: pair.plain, positions: [o.positions[0]]))
+            modes.append(Mode(name: "guided" + tag, overrides: rules, int8Layout: layout, settings: guided, loop: pair.guided, positions: o.positions))
         }
-        defer { Encoder.gemvShapeOverrides = [:] }
-        for m in modes.prefix(2) {
+        defer { Encoder.gemvShapeOverrides = [:]; Encoder.int8Layout = .int8Shipped }
+        for m in modes {
             // Synthetic prompt: every cached key and value the frames will read.
             let kv = m.loop.backbone.cache
             for layer in kv.layers {
@@ -126,7 +148,7 @@ public enum FrameBench {
 
         let only = ProcessInfo.processInfo.environment["BREEZE_FRAME_ONLY"]
         var counts: [(String, DispatchTally)] = []
-        for m in modes.prefix(2) {
+        for m in modes {
             start(m)
             let tally = DispatchTally()
             let cb = ctx.queue.makeCommandBuffer()!
@@ -141,6 +163,7 @@ public enum FrameBench {
         for round in 0..<(o.rounds + 1) {
             for i in (round % 2 == 0 ? Array(modes.indices) : modes.indices.reversed()) where only == nil || modes[i].name.hasPrefix(only!) {
                 Encoder.gemvShapeOverrides = modes[i].overrides
+                Encoder.int8Layout = modes[i].int8Layout
                 // Frames committed back to back.
                 start(modes[i])
                 let w0 = Date()
@@ -192,6 +215,7 @@ public enum FrameBench {
         }
 
         Encoder.gemvShapeOverrides = [:]
+        Encoder.int8Layout = .int8Shipped
         // What the same number of dispatches costs when each does nothing.
         let dispatches = counts[0].1.dispatches
         var floors: [Double] = []
@@ -208,7 +232,7 @@ public enum FrameBench {
 
         print("\(o.frames) frames per run, median [min-max] of \(o.rounds) interleaved rounds after one warm-up round, \(o.concurrent ? "concurrent encoder with barriers" : "serial encoder"), backbone at positions \(o.positions)")
         for (i, m) in modes.enumerated() where !m.gpu.isEmpty {
-            let tally = counts[i % 2].1
+            let tally = counts[i].1
             let gb = Double(tally.weightBytes) / 1e9
             print(String(format: "frame %@: gpu %@ ms, wall %@ ms, one-at-a-time wall %@ ms, stages backbone %@ + codes %@ ms",
                          m.name, span(m.gpu), span(m.wall), span(m.syncWall), span(m.backbone), span(m.codes)))

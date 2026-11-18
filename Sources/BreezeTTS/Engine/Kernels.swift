@@ -10,12 +10,16 @@ struct GPUTensor {
     let count: Int
 }
 
-/// y = x W^T (+ bias). `w` is bf16 [n, k] row-major.
+/// y = x W^T (+ bias). `w` is bf16 [n, k] row-major, or int8 [n, k] when `scales` is set.
 struct Linear {
     let w: GPUTensor
     let bias: GPUTensor?
     let n: Int
     let k: Int
+    /// fp16 [n, `Int8Stripes.lanes`]: `w` is int8 and these are its stripe scales.
+    var scales: GPUTensor? = nil
+
+    var weightBytes: Int { scales == nil ? n * k * 2 : n * (k + Int8Stripes.lanes * 2) }
 }
 
 struct GemvFlags: OptionSet {
@@ -55,6 +59,8 @@ struct GemvLayout: Hashable {
     /// CPUs. No per-shape table did better there. Sustained generation is the engine's job, so
     /// this layout ships.
     static let shipped = GemvLayout(simdgroups: 1, columns: 2)
+    /// The int8 kernel's layout. Set from the frame bench; see `Encoder.int8Layout`.
+    static let int8Shipped = GemvLayout(simdgroups: 1, columns: 2)
 
     init(simdgroups: Int, columns: Int) {
         self.simdgroups = simdgroups
@@ -62,11 +68,11 @@ struct GemvLayout: Hashable {
     }
 
     /// "sgN" or "sgNrC".
-    init?(_ spec: String) {
+    init?(_ spec: String, columns allowed: [Int] = Kernels.gemvColumns) {
         let parts = spec.dropFirst(2).split(separator: "r").compactMap { Int($0) }
         guard spec.hasPrefix("sg"), let sg = parts.first, Self.simdgroupChoices.contains(sg), parts.count <= 2 else { return nil }
         let columns = parts.count == 2 ? parts[1] : 1
-        guard Kernels.gemvColumns.contains(columns) else { return nil }
+        guard allowed.contains(columns) else { return nil }
         self.init(simdgroups: sg, columns: columns)
     }
 }
@@ -160,6 +166,9 @@ final class Kernels: @unchecked Sendable {
     struct GV: Hashable { let mr, nr: Int }
     static let gemvColumns = [1, 2]
     let gemv: [GV: MTLComputePipelineState]
+    /// The int8 scalar GEMV, by the same key.
+    static let gemvInt8Columns = [1, 2, 4]
+    let gemvInt8: [GV: MTLComputePipelineState]
     /// gemm8 variants by (K split, column tiles).
     struct G8: Hashable { let ks, nc: Int }
     static let gemm8Variants = [G8(ks: 4, nc: 1), G8(ks: 4, nc: 2), G8(ks: 4, nc: 4), G8(ks: 8, nc: 1), G8(ks: 8, nc: 2), G8(ks: 8, nc: 4), G8(ks: 16, nc: 1), G8(ks: 16, nc: 2)]
@@ -177,6 +186,11 @@ final class Kernels: @unchecked Sendable {
             for nr in Kernels.gemvColumns { g[GV(mr: mr, nr: nr)] = try ctx.pipeline("gemv_\(mr)_\(nr)") }
         }
         gemv = g
+        var g8i: [GV: MTLComputePipelineState] = [:]
+        for mr in [1, 2] {
+            for nr in Kernels.gemvInt8Columns { g8i[GV(mr: mr, nr: nr)] = try ctx.pipeline("gemv_i8_\(mr)_\(nr)") }
+        }
+        gemvInt8 = g8i
         var g8: [G8: MTLComputePipelineState] = [:]
         for v in Kernels.gemm8Variants { g8[v] = try ctx.pipeline("gemm8_\(v.ks)_\(v.nc)") }
         gemm8 = g8
@@ -300,17 +314,39 @@ final class Encoder {
     /// Overridable for the micro-bench.
     nonisolated(unsafe) static var causalDecodeSplit = 8
 
-    /// y[m, n] = sum_k x[m, k] w[n, k] with the epilogue in `flags`. `gate` holds the second
-    /// matrix for a gated flag, in which case `linear` is the gate projection. Rows of x past m
+    /// The int8 kernel's layout: simdgroups per threadgroup and output columns per simdgroup.
+    /// Overridable for the benches.
+    nonisolated(unsafe) static var int8Layout = GemvLayout.int8Shipped
+
+    /// y[m, n] = sum_k x[m, k] w[n, k] with the epilogue in `flags`. `gate` is the second
+    /// projection for a gated flag, in which case `linear` is the gate projection. Rows of x past m
     /// are never read. One or two rows take the scalar kernel (any N, K % 8 == 0), prefill shapes
     /// that tile (16 rows and up, N % 64 == 0, K % 32 == 0) the tiled GEMM, the rest the
-    /// matrix-unit kernel (any N, K % 32 == 0).
-    func linear(_ x: ActView, rows m: Int, _ linear: Linear, _ y: ActView, flags: GemvFlags = [], gate: GPUTensor? = nil) {
+    /// matrix-unit kernel (any N, K % 32 == 0). int8 weights take the int8 scalar kernel at any
+    /// row count, two rows per read of the weights.
+    func linear(_ x: ActView, rows m: Int, _ linear: Linear, _ y: ActView, flags: GemvFlags = [], gate: Linear? = nil) {
         struct P { var M, N, K, ldx, ldy, flags, sg: UInt32 }
         precondition(flags.isGated == (gate != nil), "a gated epilogue needs the second weight")
+        precondition(gate.map { $0.n == linear.n && $0.k == linear.k && ($0.scales == nil) == (linear.scales == nil) } ?? true, "gate and up must share a shape and a format")
         var f = flags
         if linear.bias != nil { f.insert(.bias) }
-        let weights = linear.n * linear.k * 2
+        let weights = linear.weightBytes
+        if let scales = linear.scales {
+            precondition(linear.bias == nil && linear.k % Int8Stripes.period == 0, "the int8 kernel has no bias and needs K % \(Int8Stripes.period) == 0")
+            let layout = Encoder.int8Layout, mr = min(m, 2)
+            begin(k.gemvInt8[Kernels.GV(mr: mr, nr: layout.columns)]!, weightBytes: weights * (gate == nil ? 1 : 2))
+            bind(x, 0)
+            bind(linear.w, 1)
+            bind(gate?.w ?? linear.w, 2)
+            bind(scales, 3)
+            bind(y, 4)
+            setBytes(P(M: UInt32(m), N: UInt32(linear.n), K: UInt32(linear.k), ldx: UInt32(x.ld), ldy: UInt32(y.ld), flags: f.rawValue, sg: UInt32(layout.simdgroups)), index: 5)
+            bind(gate?.scales ?? scales, 6)
+            let per = layout.simdgroups * layout.columns
+            ce.dispatchThreadgroups(MTLSize(width: (linear.n + per - 1) / per, height: (m + mr - 1) / mr, depth: 1),
+                                    threadsPerThreadgroup: MTLSize(width: 32 * layout.simdgroups, height: 1, depth: 1))
+            return
+        }
         let groups: MTLSize, threads: Int
         var sg = 0
         if Kernels.usesGemm(rows: m, n: linear.n, k: linear.k) {
@@ -334,7 +370,7 @@ final class Encoder {
         }
         bind(x, 0)
         bind(linear.w, 1)
-        bind(gate ?? linear.w, 2)
+        bind(gate?.w ?? linear.w, 2)
         bind(linear.bias ?? linear.w, 3)
         bind(y, 4)
         setBytes(P(M: UInt32(m), N: UInt32(linear.n), K: UInt32(linear.k), ldx: UInt32(x.ld), ldy: UInt32(y.ld), flags: f.rawValue, sg: UInt32(sg)), index: 5)

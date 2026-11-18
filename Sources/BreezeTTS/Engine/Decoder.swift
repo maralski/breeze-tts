@@ -104,7 +104,7 @@ struct DecoderForward {
             }
             e.linear(attn, rows: block.count, layer.o, x, flags: .accumulate)
             e.rmsnorm(x, rows: block.count, width: c.hidden, weight: layer.norm2, normed, eps: c.eps)
-            e.linear(normed, rows: block.count, layer.gate, mlp, flags: .siluGate, gate: layer.up.w)
+            e.linear(normed, rows: block.count, layer.gate, mlp, flags: .siluGate, gate: layer.up)
             e.linear(mlp, rows: block.count, layer.down, x, flags: .accumulate)
             afterLayer?(i)
         }

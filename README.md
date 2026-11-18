@@ -62,6 +62,8 @@ These options change sampling:
 
 Text longer than one fragment is spoken fragment by fragment. The tool then also writes each fragment as `FILE.fragN.wav`.
 
+`--depth-weights int8` holds part of the model in 8 bits and generates faster. See [8-bit weights for the depth decoder](#8-bit-weights-for-the-depth-decoder) before you turn it on.
+
 To measure speed, run `breeze-tts --bench` under `scripts/gpulock.py`. `breeze-tts --help` lists every option, including the parity check and the kernel benchmarks.
 
 ## Use the library
@@ -154,6 +156,71 @@ Generation runs faster than real time on an M3 Max. These numbers come from `bre
 Each cell gives the median of each invocation and the range over both. Time to first audio runs from the `synthesize` call to the first 80 ms chunk and includes the text encoding and the prefill. The first request after loading the model is slower, because it also allocates the frame loop: 186 to 289 ms to first audio over three runs of a plain sentence under the same load. At other times that day, the same benchmark measured as low as 1.24 (plain) and 1.08 (guided) seconds of audio per second.
 
 The GPU time of the frame loop sets the speed. Earlier the same day, `breeze-tts --bench-frame` measured 44 ms per frame unguided and 49 ms guided, most of it in the depth decoder's 15 sequential steps per frame, and `breeze-tts --bench-codec --token-loop` measured 5 ms more per frame to decode it to audio. An end-to-end frame takes about 5% longer than that GPU work.
+
+## 8-bit weights for the depth decoder
+
+Each frame runs the depth decoder 15 times. Those passes read 10.0 GB of the 12.96 GB of weights a frame touches, and 90.6% of that is the three MLP projections of each of its 12 layers. With int8 weights those projections are held as 8-bit integers and the frame reads 8.63 GB.
+
+The option is off by default. Turn it on when the model loads:
+
+```swift
+let model = try BreezeTTSModel(directory: directory, depthWeights: .int8)
+```
+
+```sh
+.build/release/breeze-tts --say "The garden stays open until sunset." --depth-weights int8
+```
+
+The checkpoint on disk stays as it is. At load, each row of each projection is split into the 32 groups of weights that the 32 lanes of the kernel read, and each group gets one 16-bit scale, its largest weight over 127. Every weight is rounded to the nearest multiple of its scale. The result lives in GPU memory only and is never written to a file. Attention weights, the codebook heads, the embeddings and the backbone stay bf16. Quantizing the attention projections cost as much error as the whole MLP for 4.6% of the bytes. Loading takes about 0.2 s longer (1.6 s against 1.4 s, medians of five alternating loads with the files cached), and the model holds 289 MB less memory.
+
+The bf16 path matches the reference's fp32 run stage by stage. The int8 path cannot. Its audio differs from the bf16 audio for the same seed, in the way two seeds differ.
+
+### Speed
+
+Both formats were loaded in one process and took turns, on the M3 Max described under [Speed](#speed), on 18 November 2026. The GPU column is the GPU time of a frame from `breeze-tts --bench-frame` with `BREEZE_FRAME_VARIANTS="default;int8"` (median of 9 rounds of 12 frames). The last column is `breeze-tts --bench --repeat 7 --compare-depth-weights`, end to end with the codec. Brackets hold the range over rounds or runs. The hot rows were measured straight after a 150-frame run of the same bench, during which the machine slowed to 85 ms per bf16 frame for a reason that was not isolated.
+
+| Machine state | Request | GPU ms per frame, bf16 to int8 | Frames per second, bf16 to int8 |
+| --- | --- | --- | --- |
+| After ten idle minutes | Plain, unguided | 43.9 to 32.8 (11.1 ms less, 10.4 to 12.1 per round) | 19.9 to 25.9 (1.31 times, 1.30 to 1.35) |
+| After ten idle minutes | Voice design, guidance 4 | 44.8 to 35.9 (8.9 ms less, 7.9 to 9.8) | 19.0 to 21.9 (1.17 times, 1.14 to 1.20) |
+| Hot | Plain, unguided | 52.0 to 39.9 (12.3 ms less, 6.1 to 15.1) | 16.9 to 21.4 (1.27 times, 1.25 to 1.29) |
+| Hot | Voice design, guidance 4 | 56.3 to 51.6 (6.7 ms less, 2.6 to 11.1) | 16.2 to 18.1 (1.13 times, 1.11 to 1.14) |
+
+int8 was faster in every round and every run. Across the quality study below, which mixes every task, the runs on the int8 kernel produced 1.38 seconds of audio per second and the bf16 runs 1.20 to 1.25.
+
+The frame reads 4.33 GB less, which at the frame's own rate of 295 GB/s would save 14.7 ms. An unguided frame gets three quarters of that. With one row of activations the int8 kernel still moves 255 to 341 GB/s of its smaller weights, so memory bandwidth still limits it. A guided frame gets less. Its two rows share each weight read, so every weight costs two multiply-adds and a conversion, and the kernel runs out of arithmetic at 178 to 261 GB/s. The rest of the frame is unchanged. The backbone step alone takes 9.4 ms of it.
+
+### Quality
+
+8 bits cannot reproduce bf16 weights, so "no loss" is a measured claim with limits, not a guarantee.
+
+Two measurements were made, on 18 November 2026.
+
+The first is the error in the depth decoder's logits, teacher-forced on the five reference cases (7,425 draws) and read where the sampler looks, after guidance, temperature 0.9 and top-k 50. Against the reference's fp32 run, the int8 weights move the sampling distribution by a total variation distance of 0.006 on average, and the most likely code agrees on 99.0% of draws. The reference's own bf16 run, which is how the model ships, moves it by 0.038 and agrees on 94.0%. The int8 error is about a sixth of that.
+
+The second is a corpus study with a pass rule written down before any int8 audio was scored. It has 340 items in seven groups: plain English, voice design, cloning, direction, Chinese, vocal-event tags, and long text in three fragments. Each item ran four times, as bf16 and as int8 on each of two seeds. One of the two int8 runs used the int8 kernel. The other used the same int8 weights multiplied back out to bf16, as a control for the kernel. That gives 680 runs per format and 3.9 hours of audio in all. Whisper scored the words and CAM++ scored the speaker.
+
+| Measure | bf16 | int8 |
+| --- | --- | --- |
+| Runs that did not reach end of speech | 0 of 680 | 0 of 680 |
+| Runs with an error rate above 0.20 | 1 | 2 |
+| Runs with an outlying length (frames per word) | 5 | 3 |
+| Runs with an outlying speaker similarity (clone, direction, long text) | 4 of 280 | 2 of 280 |
+| Mean word or character error rate | 0.0120 | 0.0109 |
+| Mean speaker similarity | 0.831 | 0.834 |
+
+No difference is significant, and every rule passed. Changing the format at a fixed seed changed a run about as much as changing the seed did: 6 and 7 items changed flag status between formats, and 8 between two bf16 seeds.
+
+The study has limits:
+
+- It cannot see a failure that happens less often than about once in 150 runs.
+- Its length check only catches runs that are too long. Its lower limit fell below zero in most groups, so a cut-off utterance shows only through its missing words. Counted afterwards, outside the rule, 4 runs of each format were shorter than 0.6 of their group's median pace.
+- Its judges are a speech recognizer and a speaker model. It does not measure prosody, fine timbre, or whether a vocal event is performed.
+- It covers English and Mandarin, four reference voices made by the model itself, and text of up to three fragments.
+
+So the option stays off by default.
+
+Nobody has compared the two by ear. `tools/quant/study.py` reruns the study, and `tools/quant/depth_quant.py` reruns the logit measurements and the scheme sweep.
 
 ## Test
 

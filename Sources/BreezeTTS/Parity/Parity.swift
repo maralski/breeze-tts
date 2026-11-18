@@ -66,8 +66,10 @@ public final class BreezeParity {
     let tokenizer: BreezeTokenizer
     public static let threshold = 0.9999
 
-    public init(weights: URL) throws {
-        synth = try Synthesizer(directory: weights)
+    public convenience init(weights: URL) throws { try self.init(weights: weights, depth: .bf16) }
+
+    init(weights: URL, depth: DepthWeightFormat) throws {
+        synth = try Synthesizer(directory: weights, depth: depth)
         tokenizer = try BreezeTokenizer(tokenizerJSON: weights.appendingPathComponent("tokenizer.json"))
     }
 
@@ -228,7 +230,7 @@ public final class BreezeParity {
         var backbone: [Float] = []
         var depth: [Float] = []
     }
-    private var teacherDraws: [String: Draws] = [:]
+    private(set) var teacherDraws: [String: Draws] = [:]
 
     private func settings(_ golden: GoldenCase, mode: String) -> BreezeSynthesisOptions {
         var o = BreezeSynthesisOptions()

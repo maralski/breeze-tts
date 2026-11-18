@@ -69,6 +69,37 @@ final class WeightArena {
         return Linear(w: try tensor(prefix + ".weight"), bias: nil, n: n, k: k)
     }
 
+    /// The projection in `format`. The int8 forms are computed here, from the mapped bf16
+    /// straight into the buffer, and exist nowhere else.
+    func linear(_ prefix: String, n: Int, k: Int, format: DepthWeightFormat) throws -> Linear {
+        let name = prefix + ".weight"
+        switch format {
+        case .bf16:
+            return try linear(prefix, n: n, k: k)
+        case .int8:
+            try expect(name, shape: [n, k])
+            let weights = place(bytes: n * k), scales = place(bytes: n * Int8Stripes.lanes * 2)
+            if let buffer, !planning {
+                try store.withBytes(name) { raw, _ in
+                    Int8Stripes.quantize(raw.baseAddress!.assumingMemoryBound(to: UInt16.self), n: n, k: k,
+                                         q: (buffer.contents() + weights).assumingMemoryBound(to: Int8.self),
+                                         scales: (buffer.contents() + scales).assumingMemoryBound(to: Float16.self))
+                }
+            }
+            return Linear(w: tensorAt(weights, count: n * k), bias: nil, n: n, k: k, scales: tensorAt(scales, count: n * Int8Stripes.lanes))
+        case .int8Reference:
+            try expect(name, shape: [n, k])
+            let offset = place(bytes: n * k * 2)
+            if let buffer, !planning {
+                try store.withBytes(name) { raw, _ in
+                    Int8Stripes.reference(raw.baseAddress!.assumingMemoryBound(to: UInt16.self), n: n, k: k,
+                                          into: (buffer.contents() + offset).assumingMemoryBound(to: UInt16.self))
+                }
+            }
+            return Linear(w: tensorAt(offset, count: n * k), bias: nil, n: n, k: k)
+        }
+    }
+
     /// Several [n_i, k] projections of one input as a single [sum n_i, k] weight.
     func stackedLinear(_ prefixes: [String], n: [Int], k: Int) throws -> Linear {
         var total = 0
@@ -217,7 +248,8 @@ struct DecoderWeights {
         self.finalNorm = finalNorm
     }
 
-    init(_ a: WeightArena, prefix: String, config c: DecoderConfig) throws {
+    /// `mlp` is the format of gate, up and down; everything else stays bf16.
+    init(_ a: WeightArena, prefix: String, config c: DecoderConfig, mlp: DepthWeightFormat = .bf16) throws {
         config = c
         layers = try (0..<c.layers).map { i in
             let p = "\(prefix).layers.\(i)", at = "\(p).self_attn"
@@ -227,9 +259,9 @@ struct DecoderWeights {
                 qkNorm: c.qkNorm ? try a.tensor("\(at).q_norm.weight", "\(at).k_norm.weight") : nil,
                 o: try a.linear("\(at).o_proj", n: c.hidden, k: c.qWidth),
                 norm2: try a.vector("\(p).post_attention_layernorm.weight", count: c.hidden),
-                gate: try a.linear("\(p).mlp.gate_proj", n: c.intermediate, k: c.hidden),
-                up: try a.linear("\(p).mlp.up_proj", n: c.intermediate, k: c.hidden),
-                down: try a.linear("\(p).mlp.down_proj", n: c.hidden, k: c.intermediate))
+                gate: try a.linear("\(p).mlp.gate_proj", n: c.intermediate, k: c.hidden, format: mlp),
+                up: try a.linear("\(p).mlp.up_proj", n: c.intermediate, k: c.hidden, format: mlp),
+                down: try a.linear("\(p).mlp.down_proj", n: c.hidden, k: c.intermediate, format: mlp))
         }
         finalNorm = try a.vector("\(prefix).norm.weight", count: c.hidden)
     }
@@ -271,14 +303,24 @@ struct FrameWeights {
         self.embedding = embedding
     }
 
-    init(_ store: any TensorStore, ctx: MetalContext) throws {
+    /// `depth` is the format of the depth decoder's MLP weights.
+    /// The same weights with the depth decoder's layers loaded again in `format`, for a bench
+    /// that compares formats in one process.
+    func withDepth(_ format: DepthWeightFormat, store: any TensorStore, ctx: MetalContext) throws -> FrameWeights {
+        let stack = try WeightArena.load(store, ctx: ctx, label: "weights.depth.\(format)") {
+            try DecoderWeights($0, prefix: "depth_decoder.model", config: .depth, mlp: format)
+        }
+        return FrameWeights(backbone: backbone, lmHead: lmHead, depth: stack, depthProjector: depthProjector, codebookHeads: codebookHeads, embedding: embedding)
+    }
+
+    init(_ store: any TensorStore, ctx: MetalContext, depth format: DepthWeightFormat = .bf16) throws {
         backbone = try WeightArena.load(store, ctx: ctx, label: "weights.backbone") {
             try DecoderWeights($0, prefix: "backbone_model", config: .backbone)
         }
         (lmHead, depth, depthProjector, codebookHeads, embedding) = try WeightArena.load(store, ctx: ctx, label: "weights.depth") { a in
             let d = DecoderConfig.depth
             let lm = try a.linear("lm_head", n: BreezeShape.backboneVocab, k: DecoderConfig.backbone.hidden)
-            let stack = try DecoderWeights(a, prefix: "depth_decoder.model", config: d)
+            let stack = try DecoderWeights(a, prefix: "depth_decoder.model", config: d, mlp: format)
             let projector = try a.linear("depth_decoder.model.inputs_embeds_projector", n: d.hidden, k: BreezeShape.embedWidth)
             let heads = try a.transposedHeads("depth_decoder.codebooks_head.weight", count: BreezeShape.codebooks - 1, inWidth: d.hidden, outWidth: BreezeShape.codebookVocab)
             let table = try a.linear("depth_decoder.model.embed_tokens", n: BreezeShape.codebooks * BreezeShape.codebookVocab, k: BreezeShape.embedWidth)

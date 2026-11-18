@@ -28,17 +28,22 @@ public enum GemvBench {
         Shape(label: "codebook head", m: m, n: 2051, k: 1024, flags: []),
     ] }
 
-    /// A `GemvLayout` spec ("sgN", "sgNrC"), or "gemm8": the matrix-unit kernel even at one or
-    /// two rows.
+    /// A `GemvLayout` spec ("sgN", "sgNrC"), "gemm8": the matrix-unit kernel even at one or
+    /// two rows, or "i8:sgNrC": the int8 kernel in that layout, on the shapes it accepts, the
+    /// pool read as int8 with every scale 1/64.
     struct Variant {
         let label: String
         var layout = GemvLayout.shipped
         var scalarRowsMax = 2
+        var int8 = false
 
         init(_ spec: String) throws {
             label = spec
             if spec == "gemm8" { scalarRowsMax = 0; return }
-            guard let l = GemvLayout(spec) else { throw BreezeTTSError.badInput("unknown bench variant \(spec)") }
+            int8 = spec.hasPrefix("i8:")
+            guard let l = GemvLayout(int8 ? String(spec.dropFirst(3)) : spec, columns: int8 ? Kernels.gemvInt8Columns : Kernels.gemvColumns) else {
+                throw BreezeTTSError.badInput("unknown bench variant \(spec)")
+            }
             layout = l
         }
     }
@@ -52,6 +57,10 @@ public enum GemvBench {
         let x = try ctx.makeBuffer(bytes: 16 * 8192 * 4, label: "bench.x")
         fillF32(x, offset: 0, count: 16 * 8192)
         let y = try ctx.makeBuffer(bytes: 16 * 8192 * 4, label: "bench.y")
+        let ones = try ctx.makeBuffer(bytes: 8192 * Int8Stripes.lanes * 2, label: "bench.scales")
+        let half = ones.contents().bindMemory(to: Float16.self, capacity: 8192 * Int8Stripes.lanes)
+        for i in 0..<(8192 * Int8Stripes.lanes) { half[i] = 1 / 64 }
+        let scales = GPUTensor(buffer: ones, offset: 0, count: 8192 * Int8Stripes.lanes)
         let specs = (ProcessInfo.processInfo.environment["BREEZE_BENCH_VARIANTS"] ?? "sg1,sg2,sg4,sg8").split(separator: ",").map(String.init)
         let variants = try specs.map(Variant.init)
 
@@ -70,35 +79,40 @@ public enum GemvBench {
         for _ in 0..<rounds {
             floors.append(try time { e in for _ in 0..<repeats { e.copy(ActView(x, ld: 1), count: 1, to: ActView(y, ld: 1)) } })
         }
-        print(String(format: "%d dispatches per shape, median of %d interleaved command buffers, us per dispatch (GB/s of weights); empty dispatch floor %.1f us", repeats, rounds, floors.sorted()[rounds / 2]))
+        print(String(format: "%d dispatches per shape, median of %d interleaved command buffers, us per dispatch (GB/s of the weight bytes that variant reads); empty dispatch floor %.1f us", repeats, rounds, floors.sorted()[rounds / 2]))
         print("shape              M     N     K    MB  " + variants.map { $0.label.padding(toLength: 18, withPad: " ", startingAt: 0) }.joined())
-        defer { Encoder.gemvLayoutOverride = nil; Encoder.scalarRowsMax = 2 }
+        defer { Encoder.gemvLayoutOverride = nil; Encoder.scalarRowsMax = 2; Encoder.int8Layout = .int8Shipped }
         for s in shapes {
+            let fitsInt8 = s.k % Int8Stripes.period == 0
             func encodeAll(_ v: Variant) -> (Encoder) -> Void {
                 return { e in
                     Encoder.gemvLayoutOverride = v.layout
                     Encoder.scalarRowsMax = v.scalarRowsMax
+                    Encoder.int8Layout = v.int8 ? v.layout : .int8Shipped
+                    // An int8 matrix is half the bytes, so the walk through the pool is half as fast.
+                    let one = s.n * s.k * (v.int8 ? 1 : 2), step = one * (s.flags.isGated ? 2 : 1)
                     var offset = 0
                     for _ in 0..<repeats {
-                        if offset + s.bytes > poolBytes { offset = 0 }
-                        let lin = Linear(w: GPUTensor(buffer: pool, offset: offset, count: s.n * s.k), bias: nil, n: s.n, k: s.k)
-                        let gate = s.flags.isGated ? GPUTensor(buffer: pool, offset: offset + s.n * s.k * 2, count: s.n * s.k) : nil
+                        if offset + step > poolBytes { offset = 0 }
+                        let lin = Linear(w: GPUTensor(buffer: pool, offset: offset, count: s.n * s.k), bias: nil, n: s.n, k: s.k, scales: v.int8 ? scales : nil)
+                        let gate = s.flags.isGated ? Linear(w: GPUTensor(buffer: pool, offset: offset + one, count: s.n * s.k), bias: nil, n: s.n, k: s.k, scales: v.int8 ? scales : nil) : nil
                         e.linear(ActView(x, ld: s.k), rows: s.m, lin, ActView(y, ld: s.n), flags: s.flags, gate: gate)
-                        offset += s.bytes
+                        offset += step
                     }
                 }
             }
             var samples = [[Double]](repeating: [], count: variants.count)
             for r in 0..<(rounds + 1) {
-                for i in (r % 2 == 0 ? Array(variants.indices) : Array(variants.indices.reversed())) {
+                for i in (r % 2 == 0 ? Array(variants.indices) : Array(variants.indices.reversed())) where fitsInt8 || !variants[i].int8 {
                     let t = try time(encodeAll(variants[i]))
                     if r > 0 { samples[i].append(t) }
                 }
             }
             let mb = Double(s.bytes) / 1e6
-            let cells = samples.map { v -> String in
+            let cells = zip(variants, samples).map { variant, v -> String in
+                guard !v.isEmpty else { return "        -          " }
                 let med = v.sorted()[rounds / 2]
-                return String(format: "%9.1f (%4.0f)   ", med, mb * 1e3 / med)
+                return String(format: "%9.1f (%4.0f)   ", med, mb * (variant.int8 ? 0.5 : 1) * 1e3 / med)
             }
             print(s.label.padding(toLength: 17, withPad: " ", startingAt: 0) + String(format: "%3d %5d %5d %5.1f  ", s.m, s.n, s.k, mb) + cells.joined())
         }

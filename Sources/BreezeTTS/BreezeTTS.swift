@@ -71,6 +71,19 @@ public struct BreezeGenerationReport: Sendable {
     }
 }
 
+/// How the depth decoder's MLP weights are held in memory. The depth decoder runs 15 times per
+/// frame and reads most of the weight bytes a frame touches, nearly all of them in its MLPs.
+public enum BreezeDepthWeights: Sendable {
+    /// The checkpoint's bf16 weights as they are. Matches the reference's fp32 run stage by stage.
+    case bf16
+    /// The depth decoder's MLP weights as 8-bit integers with a scale per group of weights,
+    /// computed in memory at load and never written to disk. Half the bytes per weight, so
+    /// frames come sooner; the logits move by less than the reference's own bf16 arithmetic
+    /// moves them, and the audio is no longer the bf16 path's sample for sample. See the README
+    /// for the measured speed and the quality study.
+    case int8
+}
+
 /// Breeze TTS 2 on the GPU. Audio is 24 kHz mono Float32, produced while the model generates.
 /// One request runs at a time; concurrent calls wait their turn.
 public final class BreezeTTSModel: @unchecked Sendable {
@@ -87,10 +100,23 @@ public final class BreezeTTSModel: @unchecked Sendable {
     /// `directory` holds the Hugging Face snapshot of `BreezeCheckpoint.repository`.
     /// - Throws: `BreezeTTSError.badCheckpoint` naming the files the folder lacks.
     ///   `BreezeCheckpoint` makes the same check without loading.
-    public init(directory: URL) throws {
+    public convenience init(directory: URL) throws { try self.init(directory: directory, depthWeights: .bf16) }
+
+    /// As `init(directory:)`, with the depth decoder's weights held as `depthWeights`.
+    public convenience init(directory: URL, depthWeights: BreezeDepthWeights) throws {
+        try self.init(directory: directory, format: depthWeights == .int8 ? .int8 : .bf16)
+    }
+
+    /// The quality study's control arm: the int8 weights multiplied back out onto the bf16
+    /// kernels. For tools/quant/study.py through the command-line tool, not for apps.
+    @_spi(Study) public convenience init(int8ReferenceIn directory: URL) throws {
+        try self.init(directory: directory, format: .int8Reference)
+    }
+
+    init(directory: URL, format: DepthWeightFormat) throws {
         try BreezeCheckpoint(directory: directory).require(BreezeCheckpoint.synthesisFiles)
         self.directory = directory
-        synth = try Synthesizer(directory: directory)
+        synth = try Synthesizer(directory: directory, depth: format)
         decoder = try CodecDecoder(directory: directory, ctx: synth.ctx)
         tokenizer = try BreezeTokenizer(tokenizerJSON: directory.appendingPathComponent("tokenizer.json"))
         // Every pipeline compiled up front. The frame loops stay lazy: building both at load saved
