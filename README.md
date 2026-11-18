@@ -177,14 +177,14 @@ The bf16 path matches the reference's fp32 run stage by stage. The int8 path can
 
 ### Speed
 
-Both formats were loaded in one process and took turns, on the M3 Max described under [Speed](#speed), on 18 November 2026. The GPU column is the GPU time of a frame from `breeze-tts --bench-frame` with `BREEZE_FRAME_VARIANTS="default;int8"` (median of 9 rounds of 12 frames). The last column is `breeze-tts --bench --repeat 7 --compare-depth-weights`, end to end with the codec. Brackets hold the range over rounds or runs.
+Both formats were loaded in one process and took turns, on the M3 Max described under [Speed](#speed), on 18 November 2026. The GPU column is the GPU time of a frame from `breeze-tts --bench-frame` with `BREEZE_FRAME_VARIANTS="default;int8"` (median of 9 rounds of 12 frames). The last column is `breeze-tts --bench --repeat 7 --compare-depth-weights`, end to end with the codec. Brackets hold the range over rounds or runs. The hot rows were measured straight after a 150-frame run of the same bench, during which the machine slowed to 85 ms per bf16 frame for a reason that was not isolated.
 
 | Machine state | Request | GPU ms per frame, bf16 to int8 | Frames per second, bf16 to int8 |
 | --- | --- | --- | --- |
 | After ten idle minutes | Plain, unguided | 43.9 to 32.8 (11.1 ms less, 10.4 to 12.1 per round) | 19.9 to 25.9 (1.31 times, 1.30 to 1.35) |
 | After ten idle minutes | Voice design, guidance 4 | 44.8 to 35.9 (8.9 ms less, 7.9 to 9.8) | 19.0 to 21.9 (1.17 times, 1.14 to 1.20) |
-| After hours of generation | Plain, unguided | 52.0 to 39.9 (12.3 ms less, 6.1 to 15.1) | 16.9 to 21.4 (1.27 times, 1.25 to 1.29) |
-| After hours of generation | Voice design, guidance 4 | 56.3 to 51.6 (6.7 ms less, 2.6 to 11.1) | 16.2 to 18.1 (1.13 times, 1.11 to 1.14) |
+| Hot | Plain, unguided | 52.0 to 39.9 (12.3 ms less, 6.1 to 15.1) | 16.9 to 21.4 (1.27 times, 1.25 to 1.29) |
+| Hot | Voice design, guidance 4 | 56.3 to 51.6 (6.7 ms less, 2.6 to 11.1) | 16.2 to 18.1 (1.13 times, 1.11 to 1.14) |
 
 int8 was faster in every round and every run. Across the quality study below, which mixes every task, the runs on the int8 kernel produced 1.38 seconds of audio per second and the bf16 runs 1.20 to 1.25.
 
@@ -196,7 +196,7 @@ The frame reads 4.33 GB less, which at the frame's own rate of 295 GB/s would sa
 
 Two measurements were made, on 18 November 2026.
 
-The first is the error in the depth decoder's logits, teacher-forced on the five reference cases (7,425 draws) and read where the sampler looks, after guidance, temperature 0.9 and top-k 50. Against the reference's fp32 run, the int8 weights move the sampling distribution by a total variation distance of 0.006 on average, and the most likely code agrees on 99.0% of draws. The reference's own bf16 arithmetic, which is how the model ships, moves it by 0.031 and agrees on 94.9%. The int8 error is about a fifth of that.
+The first is the error in the depth decoder's logits, teacher-forced on the five reference cases (7,425 draws) and read where the sampler looks, after guidance, temperature 0.9 and top-k 50. Against the reference's fp32 run, the int8 weights move the sampling distribution by a total variation distance of 0.006 on average, and the most likely code agrees on 99.0% of draws. The reference's own bf16 run, which is how the model ships, moves it by 0.038 and agrees on 94.0%. The int8 error is about a sixth of that.
 
 The second is a corpus study with a pass rule written down before any int8 audio was scored. It has 340 items in seven groups: plain English, voice design, cloning, direction, Chinese, vocal-event tags, and long text in three fragments. Each item ran four times, as bf16 and as int8 on each of two seeds. One of the two int8 runs used the int8 kernel. The other used the same int8 weights multiplied back out to bf16, as a control for the kernel. That gives 680 runs per format and 3.9 hours of audio in all. Whisper scored the words and CAM++ scored the speaker.
 
@@ -214,6 +214,7 @@ No difference is significant, and every rule passed. Changing the format at a fi
 The study has limits:
 
 - It cannot see a failure that happens less often than about once in 150 runs.
+- Its length check only catches runs that are too long. Its lower limit fell below zero in most groups, so a cut-off utterance shows only through its missing words. Counted afterwards, outside the rule, 4 runs of each format were shorter than 0.6 of their group's median pace.
 - Its judges are a speech recognizer and a speaker model. It does not measure prosody, fine timbre, or whether a vocal event is performed.
 - It covers English and Mandarin, four reference voices made by the model itself, and text of up to three fragments.
 

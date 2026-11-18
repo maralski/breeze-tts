@@ -183,9 +183,9 @@ final class QuantizationTests: GPUTestCase {
 
     /// Teacher-forced on the reference's codes, the int8 kernel and the dequantized weights on
     /// the bf16 kernels give the same guided depth logits to within the bf16 rounding of the
-    /// reference weights, and both stay as close to the fp32 goldens as the scheme sweep
-    /// measured (cosine 0.9997 at worst over this case's rows; the reference's own bf16 run is
-    /// at 0.9996).
+    /// reference weights (measured: 0.047 at worst on logits up to 30), and both stay as close to the fp32 goldens as the scheme sweep
+    /// measured (cosine 0.99992 at worst over this case's rows; the reference's own bf16 run is
+    /// at 0.99968).
     func testFrameAgainstDequantizedWeights() throws {
         guard let goldens = ProcessInfo.processInfo.environment["BREEZE_GOLDENS"] else { throw XCTSkip("set BREEZE_GOLDENS") }
         guard let weights = TestEnvironment.weightsDirectory else { throw XCTSkip("no Breeze-TTS-2 checkpoint") }
@@ -195,6 +195,7 @@ final class QuantizationTests: GPUTestCase {
             let parity = try BreezeParity(weights: weights, depth: format)
             let report = try parity.run(caseDirectory: dir)
             let line = try XCTUnwrap(report.tensors.first { $0.name == "tf_sampled_depth_logits" })
+            print("\(format): \(line.description)")
             XCTAssertGreaterThan(line.cosine, 0.9995, "\(format): \(line.description)")
             XCTAssertLessThan(line.cosine, 0.999999, "\(format) ran quantized weights: \(line.description)")
             for other in report.tensors where !other.name.contains("depth_logits") { XCTAssertTrue(other.passed, other.description) }
@@ -202,7 +203,8 @@ final class QuantizationTests: GPUTestCase {
         }
         let scale = draws[1].map(abs).max()!
         let worst = zip(draws[0], draws[1]).map { abs($0 - $1) }.max()!
-        XCTAssertLessThan(worst, 0.02 * scale, "int8 kernel against the dequantized weights")
+        print(String(format: "int8 kernel against the dequantized weights, guided depth logits: worst difference %.4f, largest logit %.2f", worst, scale))
+        XCTAssertLessThan(worst, 0.004 * scale, "int8 kernel against the dequantized weights")
     }
 
     // MARK: public option
