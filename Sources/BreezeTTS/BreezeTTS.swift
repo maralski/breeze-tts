@@ -103,12 +103,19 @@ public final class BreezeTTSModel: @unchecked Sendable {
     public convenience init(directory: URL) throws { try self.init(directory: directory, depthWeights: .bf16) }
 
     /// As `init(directory:)`, with the depth decoder's weights held as `depthWeights`.
-    public init(directory: URL, depthWeights: BreezeDepthWeights) throws {
+    public convenience init(directory: URL, depthWeights: BreezeDepthWeights) throws {
+        try self.init(directory: directory, format: depthWeights == .int8 ? .int8 : .bf16)
+    }
+
+    /// The quality study's control arm: the int8 weights multiplied back out onto the bf16
+    /// kernels. For tools/quant/study.py through the command-line tool, not for apps.
+    @_spi(Study) public convenience init(int8ReferenceIn directory: URL) throws {
+        try self.init(directory: directory, format: .int8Reference)
+    }
+
+    init(directory: URL, format: DepthWeightFormat) throws {
         try BreezeCheckpoint(directory: directory).require(BreezeCheckpoint.synthesisFiles)
         self.directory = directory
-        var format: DepthWeightFormat = depthWeights == .int8 ? .int8 : .bf16
-        // The quality study's control arm: the int8 weights on the bf16 kernels.
-        if format == .int8, ProcessInfo.processInfo.environment["BREEZE_INT8_REFERENCE"] != nil { format = .int8Reference }
         synth = try Synthesizer(directory: directory, depth: format)
         decoder = try CodecDecoder(directory: directory, ctx: synth.ctx)
         tokenizer = try BreezeTokenizer(tokenizerJSON: directory.appendingPathComponent("tokenizer.json"))

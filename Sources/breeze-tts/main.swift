@@ -1,6 +1,6 @@
 // Copyright 2026 Peter Marelas
 // SPDX-License-Identifier: Apache-2.0
-import BreezeTTS
+@_spi(Study) import BreezeTTS
 import Foundation
 
 let usage = """
@@ -136,7 +136,9 @@ struct Args {
         let depthWeights = depthWeights ?? self.depthWeights
         let dir = try checkpoint()
         let t0 = Date()
-        let model = try BreezeTTSModel(directory: dir, depthWeights: depthWeights)
+        // BREEZE_INT8_REFERENCE selects the quality study's control arm (tools/quant/study.py).
+        let reference = depthWeights == .int8 && ProcessInfo.processInfo.environment["BREEZE_INT8_REFERENCE"] != nil
+        let model = try reference ? BreezeTTSModel(int8ReferenceIn: dir) : BreezeTTSModel(directory: dir, depthWeights: depthWeights)
         print("loaded \(dir.path) in \(fmt(Date().timeIntervalSince(t0), 2)) s\(depthWeights == .int8 ? ", depth decoder MLP weights as int8" : "")")
         return model
     }
